@@ -30,11 +30,15 @@ with a takeover button that pauses the agent.
 On the Proxmox host, as root:
 
 ```bash
-curl -fsSLO --proto '=https' --tlsv1.2 \
-  https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/proxmox/agos-proxmox.sh
+curl -fsSLO https://kroq.dev/tools/agos-proxmox.sh
 bash agos-proxmox.sh --dry-run          # shows exactly what it will do
 bash agos-proxmox.sh --yes
 ```
+
+The script checks every image against the release signing key
+(`RWQeJEg8BJM+C3FntUGlSkbqk9PU0z3FPLJS3z4fsjfXedsmchg2OFu1`) before using it.
+To verify the script itself first, use the signed release assets as shown in
+[`deploy/README.md`](deploy/README.md).
 
 Put secrets (Tailscale key, API keys) in `/root/agos.secrets` first; see
 [`deploy/README.md`](deploy/README.md). Other hypervisors (libvirt, Incus,

@@ -20,7 +20,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb xdotool xclip x11-xserver-utils x11-utils
-      - uses: astral-sh/setup-uv@v10
+      - uses: astral-sh/setup-uv@v10.2.0  # setup-uv publishes no moving major tag
       - run: uv run --frozen pytest
       - run: uvx ruff check src tests && uvx ruff format --check src tests
 

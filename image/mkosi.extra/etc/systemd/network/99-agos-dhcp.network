@@ -1,0 +1,11 @@
+# agos fallback: DHCP on every wired NIC. cloud-init's networkd renderer writes
+# 10-cloud-init-*.network files, which sort first and win when present.
+[Match]
+Name=en* eth*
+
+[Network]
+DHCP=yes
+IPv6AcceptRA=yes
+
+[DHCPv4]
+UseDomains=yes

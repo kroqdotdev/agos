@@ -1,0 +1,51 @@
+{
+  "policies": {
+    "DontCheckDefaultBrowser": true,
+    "OverrideFirstRunPage": "",
+    "OverridePostUpdatePage": "",
+    "SkipTermsOfUse": true,
+    "DisableTelemetry": true,
+    "DisableFirefoxStudies": true,
+    "DisableProfileImport": true,
+    "DisableAppUpdate": true,
+    "NoDefaultBookmarks": true,
+    "UserMessaging": {
+      "SkipOnboarding": true,
+      "FeatureRecommendations": false,
+      "ExtensionRecommendations": false,
+      "UrlbarInterventions": false,
+      "MoreFromMozilla": false
+    },
+    "OfferToSaveLogins": false,
+    "PasswordManagerEnabled": false,
+    "AutofillAddressEnabled": false,
+    "AutofillCreditCardEnabled": false,
+    "PromptForDownloadLocation": false,
+    "DNSOverHTTPS": {
+      "Enabled": false,
+      "Locked": true
+    },
+    "Permissions": {
+      "Notifications": {
+        "BlockNewRequests": true
+      },
+      "Location": {
+        "BlockNewRequests": true
+      }
+    },
+    "FirefoxHome": {
+      "SponsoredTopSites": false,
+      "SponsoredPocket": false
+    },
+    "Preferences": {
+      "browser.sessionstore.resume_from_crash": {
+        "Value": false,
+        "Status": "locked"
+      },
+      "browser.aboutwelcome.enabled": {
+        "Value": false,
+        "Status": "locked"
+      }
+    }
+  }
+}

@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake `pveversion`: FAKE_PVE_VERSION (default 9.0.10).
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=../lib.sh
+. "$(dirname "$0")/../lib.sh"
+record pveversion "$@"
+maybe_fail pveversion "$@"
+printf 'pve-manager/%s/0123456789abcdef (running kernel: 6.14.11-2-pve)\n' "${FAKE_PVE_VERSION:-9.0.10}"

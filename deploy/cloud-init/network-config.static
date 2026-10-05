@@ -1,0 +1,14 @@
+# cloud-init network-config (version 2): fixed IPv4 address.
+# Build a seed with it: ./make-seed.sh --network-config network-config.static
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "e*"
+    addresses:
+      - 192.168.1.50/24
+    routes:
+      - to: default
+        via: 192.168.1.1
+    nameservers:
+      addresses: [192.168.1.1, 1.1.1.1]

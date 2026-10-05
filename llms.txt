@@ -1,0 +1,26 @@
+# agos
+
+> agos is an unattended Debian 13 (trixie) desktop for AI agents, shipped as UEFI disk images (qcow2 and raw, amd64 and arm64). It configures itself from a cloud-init seed at first boot, needs no human input, and gives agents an X11 desktop to drive through `agentd` (MCP and REST, with Anthropic, OpenAI and Gemini computer-use adapters). Humans watch and take over through the KasmVNC web client, reached over Tailscale.
+
+The VM is the security boundary: the agent has passwordless sudo inside it, so hypervisor and long-lived credentials stay outside. Secrets arrive only at first boot (cloud-init `write_files` into `/etc/agos/secrets.env`), never on a command line. To install on Proxmox VE, an agent should follow the install runbook, which always runs `agos-proxmox.sh --dry-run --json` first and waits for the human's "yes". Status: v0.1, under construction; the deployment tooling is tested only against a fake Proxmox so far.
+
+## Docs
+
+- [README](https://raw.githubusercontent.com/kroqdotdev/agos/main/README.md): what agos is, quick start, security model
+- [Interface spec](https://raw.githubusercontent.com/kroqdotdev/agos/main/docs/spec.md): the contract between image, agentd, deployment and CI: artifact names, config.toml and secrets.env keys, first boot, ports, agentd API, deployment script flags and exit codes
+
+## Install
+
+- [Agent install runbook](https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/install.md): executable install.md for an AI agent (for example Claude Code) on a Proxmox VE host: checks, pinned download and checksum, dry run, human approval, create, verify
+- [Deployment guide](https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/README.md): Proxmox one-liner, flags, exit codes and JSON output; seeds for QEMU/libvirt, Incus, UTM, VirtualBox, Hyper-V, TrueNAS and Unraid; reaching the desktop; reading credentials
+- [Claude Code permissions for the runbook](https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/claude-settings.example.json): allows checks and dry runs, asks before create/reset, denies `qm destroy`, edits under /etc/pve and piping downloads into a shell
+- [Example cloud-init user-data](https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/cloud-init/user-data): every config.toml key and secrets.env key with comments
+
+## Components
+
+- [agentd](https://raw.githubusercontent.com/kroqdotdev/agos/main/agentd/README.md): the control daemon: screenshots, input, windows, clipboard, takeover lease, MCP and REST
+- [image](https://raw.githubusercontent.com/kroqdotdev/agos/main/image/README.md): the mkosi recipe that builds the guest image
+
+## Optional
+
+- [Research report](https://raw.githubusercontent.com/kroqdotdev/agos/main/docs/research.md): background and rationale for the design

@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Start XFCE for the agent on :1 (systemd user unit agos-session). No display
+# manager, no login screen: the unit restarts the session if it ever exits.
+set -euo pipefail
+
+export DISPLAY="${DISPLAY:-:1}"
+export XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP=XFCE XDG_SESSION_DESKTOP=xfce DESKTOP_SESSION=xfce
+unset SESSION_MANAGER
+
+# prevents screen blanking, the X screensaver and DPMS power-off
+xset s off -dpms s noblank || true
+
+setprop() { # channel property type value
+  xfconf-query -c "$1" -p "$2" -s "$4" 2>/dev/null \
+    || xfconf-query -c "$1" -p "$2" -n -t "$3" -s "$4" 2>/dev/null || true
+}
+# prevents restored windows/apps after a session restart (deterministic start)
+setprop xfce4-session /general/SaveOnExit bool false
+setprop xfce4-session /general/AutoSave bool false
+# prevents the "Log out?" confirmation dialog
+setprop xfce4-session /general/PromptOnLogout bool false
+# prevents a lock screen on suspend/hibernate/user switch
+setprop xfce4-session /shutdown/LockScreen bool false
+setprop xfce4-screensaver /saver/enabled bool false
+setprop xfce4-screensaver /lock/enabled bool false
+
+dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP 2>/dev/null || true
+
+exec startxfce4

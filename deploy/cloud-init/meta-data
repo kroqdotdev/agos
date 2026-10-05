@@ -1,0 +1,5 @@
+# cloud-init NoCloud meta-data. Keep instance-id fixed for the life of the VM:
+# changing it makes cloud-init treat the VM as new and re-run per-instance
+# steps (new SSH host keys, users re-applied). Use a new one per new VM.
+instance-id: agos-example-0001
+local-hostname: agos

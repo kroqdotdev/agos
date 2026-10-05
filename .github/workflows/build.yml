@@ -1,0 +1,115 @@
+name: build
+
+# Builds the guest image for amd64 and arm64 on native runners, boot-tests it
+# with no input, and on a v* tag publishes a release with signed checksums.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+    paths: [image/**, agentd/**, VERSION, .github/workflows/build.yml]
+  pull_request:
+    paths: [image/**, agentd/**, VERSION, .github/workflows/build.yml]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { arch: amd64, runner: ubuntu-24.04 }
+          # No /dev/kvm on arm64 runners: the boot test falls back to TCG.
+          - { arch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      ARCH: ${{ matrix.arch }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Free disk space (the build needs ~20 GB)
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
+          df -h /
+      - name: Build
+        run: make -C image build ARCH="$ARCH" AGOS_WITH_AGENTD=yes MKOSI_ARGS=--incremental=no
+      - name: Convert (qcow2, raw.xz)
+        run: |
+          make -C image artifacts ARCH="$ARCH"
+          # Each leg's SHA256SUMS only covers its own files; the release job
+          # recomputes one for everything.
+          rm -f image/mkosi.output/SHA256SUMS
+      - name: Boot test (no keyboard, no human)
+        run: make -C image boot-test ARCH="$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: agos-${{ matrix.arch }}
+          path: |
+            image/mkosi.output/agos-*-${{ matrix.arch }}.qcow2
+            image/mkosi.output/agos-*-${{ matrix.arch }}.raw.xz
+            image/mkosi.output/agos-*-${{ matrix.arch }}.manifest
+          retention-days: 7
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: boot-test-${{ matrix.arch }}
+          path: out/
+          retention-days: 7
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: image
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v5
+      - name: Tag must match VERSION
+        run: |
+          want="v$(cat VERSION)"
+          [ "$GITHUB_REF_NAME" = "$want" ] || { echo "tag $GITHUB_REF_NAME != $want"; exit 1; }
+      - uses: actions/download-artifact@v5
+        with:
+          pattern: agos-*
+          path: dist
+          merge-multiple: true
+      - name: Checksums
+        run: |
+          cp deploy/proxmox/agos-proxmox.sh dist/
+          cd dist
+          # GitHub release assets are capped at 2 GiB each.
+          if find . -type f -size +2047M | grep .; then echo "asset over 2 GiB"; exit 1; fi
+          sha256sum agos-* | sort -k2 > SHA256SUMS
+          cat SHA256SUMS
+      - name: Sign checksums (minisign)
+        env:
+          MINISIGN_SECRET_KEY: ${{ secrets.MINISIGN_SECRET_KEY }}
+          MINISIGN_PASSWORD: ${{ secrets.MINISIGN_PASSWORD }}
+        run: |
+          if [ -z "$MINISIGN_SECRET_KEY" ]; then
+            echo "::warning::MINISIGN_SECRET_KEY not set; publishing unsigned checksums"
+            exit 0
+          fi
+          sudo apt-get update && sudo apt-get install -y --no-install-recommends minisign
+          umask 077
+          printf '%s\n' "$MINISIGN_SECRET_KEY" > "$RUNNER_TEMP/minisign.key"
+          printf '%s\n' "$MINISIGN_PASSWORD" |
+            minisign -S -s "$RUNNER_TEMP/minisign.key" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
+          rm -f "$RUNNER_TEMP/minisign.key"
+      - uses: actions/attest-build-provenance@v3
+        with:
+          subject-path: dist/agos-*
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "agos $GITHUB_REF_NAME" --generate-notes --draft

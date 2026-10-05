@@ -1,0 +1,30 @@
+# agos-firstboot: merge configuration, generate secrets, render the agent's
+# desktop/agentd/Claude Code config, join Tailscale, write state.json.
+# Idempotent; first-boot-only work is guarded by /var/lib/agos/firstboot.done,
+# the "apply" part runs on every boot so config edits take effect on reboot.
+[Unit]
+Description=agos first boot / configuration apply
+Documentation=file:///usr/share/doc/agos/README.md
+Wants=network-online.target
+After=network-online.target local-fs.target systemd-tmpfiles-setup.service
+# cloud-init write_files (/etc/agos/config.toml, secrets.env, also b64) has run
+# by the end of its config stage. Not cloud-final: that one is ordered after
+# multi-user.target and would form a cycle.
+After=cloud-init-network.service cloud-config.service
+# The agent's desktop (user manager) starts with the rendered config. Consoles
+# and SSH are deliberately not ordered after this unit (debug access first).
+Before=user@1000.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/lib/agos/agos-firstboot
+# systemd credentials agos.config / agos.secrets (SMBIOS type 11, systemd.set_credential)
+ImportCredential=agos.config
+ImportCredential=agos.secrets
+# bounded: a broken Tailscale key must not hold the desktop back forever
+TimeoutStartSec=3min
+StandardOutput=journal+console
+
+[Install]
+WantedBy=multi-user.target

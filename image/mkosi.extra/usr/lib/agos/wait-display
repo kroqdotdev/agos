@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# wait-display [DISPLAY] [TIMEOUT_S]: block until the X server answers.
+set -euo pipefail
+display="${1:-:1}"
+timeout="${2:-30}"
+for ((i = 0; i < timeout * 10; i++)); do
+  if xdpyinfo -display "$display" >/dev/null 2>&1; then
+    exit 0
+  fi
+  sleep 0.1
+done
+echo "wait-display: X server $display not answering after ${timeout}s" >&2
+exit 1

@@ -1,0 +1,6 @@
+# agos: explicit mounts by GPT partition label (stable across kernels/initrds).
+# x-systemd.growfs grows ext4 after systemd-repart has grown the partition.
+# The ESP is nofail with a short timeout so a missing ESP cannot drop boot to
+# the emergency shell.
+PARTLABEL=agos-root  /     ext4  defaults,x-systemd.growfs                                   0 1
+PARTLABEL=esp        /efi  vfat  umask=0077,nofail,x-systemd.device-timeout=10s,x-systemd.automount  0 2

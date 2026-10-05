@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# Fake `pvesh` for the agos-proxmox.sh tests: /cluster/nextid and
+# /cluster/resources, built from the fake qm state.
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=../lib.sh
+. "$(dirname "$0")/../lib.sh"
+record pvesh "$@"
+maybe_fail pvesh "$@"
+
+[[ ${1:-} == get ]] || {
+	echo "fake pvesh: only 'get' is supported" >&2
+	exit 255
+}
+path=${2:-}
+shift 2
+case $path in
+/cluster/nextid)
+	if [[ ${1:-} == --vmid ]]; then
+		if [[ -f $(conf "$2") ]]; then
+			echo "400 Parameter verification failed. vmid: VM $2 already exists" >&2
+			exit 255
+		fi
+		printf '%s\n' "$2"
+		exit 0
+	fi
+	id=100
+	while [[ -f $(conf "$id") ]]; do id=$((id + 1)); done
+	printf '%s\n' "$id"
+	;;
+/cluster/resources)
+	rows=()
+	for f in "$QDIR"/*.conf; do
+		[[ -e $f ]] || continue
+		id=$(basename "$f" .conf)
+		rows+=("$id" "$(conf_get "$id" name)" "$(conf_get "$id" tags)" "$(cat "$QDIR/$id.status")" "$(vm_node "$id")")
+	done
+	perl -MJSON::PP -e '
+		my @r;
+		while (my ($id, $name, $tags, $status, $node) = splice(@ARGV, 0, 5)) {
+			push @r, { id => "qemu/$id", type => "qemu", vmid => 0 + $id, name => $name,
+				tags => $tags, status => $status, node => $node };
+		}
+		print JSON::PP->new->canonical->encode(\@r), "\n";
+	' "${rows[@]}"
+	;;
+*)
+	echo "fake pvesh: unsupported path $path" >&2
+	exit 255
+	;;
+esac

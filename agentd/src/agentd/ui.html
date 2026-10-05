@@ -1,0 +1,160 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agentd</title>
+<style>
+  :root { --fg:#1d232a; --muted:#5b6672; --line:#d9dee3; --bg:#f7f8fa; --ok:#1f7a4d; --warn:#b4471f; }
+  * { box-sizing: border-box; }
+  body { margin:0; font:14px/1.45 system-ui, sans-serif; color:var(--fg); background:var(--bg); }
+  header { display:flex; gap:1rem; align-items:center; padding:.75rem 1.25rem; border-bottom:1px solid var(--line); background:#fff; }
+  header h1 { font-size:1rem; margin:0; letter-spacing:.02em; }
+  header .grow { flex:1; }
+  main { display:grid; grid-template-columns: minmax(280px, 360px) 1fr; gap:1.25rem; padding:1.25rem; max-width:1400px; }
+  section { background:#fff; border:1px solid var(--line); border-radius:6px; padding:1rem; }
+  h2 { font-size:.8rem; text-transform:uppercase; letter-spacing:.06em; color:var(--muted); margin:0 0 .75rem; }
+  dl { display:grid; grid-template-columns:auto 1fr; gap:.25rem .75rem; margin:0; }
+  dt { color:var(--muted); } dd { margin:0; font-variant-numeric: tabular-nums; word-break:break-all; }
+  button { font:inherit; padding:.45rem .9rem; border-radius:4px; border:1px solid var(--line); background:#fff; cursor:pointer; }
+  button.primary { background:var(--fg); color:#fff; border-color:var(--fg); }
+  button:disabled { opacity:.45; cursor:default; }
+  input { font:inherit; padding:.4rem .5rem; border:1px solid var(--line); border-radius:4px; width:100%; }
+  .lease { font-weight:600; } .lease.agent { color:var(--ok); } .lease.human { color:var(--warn); }
+  .row { display:flex; gap:.5rem; margin-top:.75rem; flex-wrap:wrap; }
+  table { width:100%; border-collapse:collapse; font-size:12.5px; }
+  td, th { text-align:left; padding:.3rem .4rem; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; }
+  td.mono, .mono { font-family: ui-monospace, monospace; }
+  #shot { max-width:100%; border:1px solid var(--line); margin-top:.75rem; display:none; }
+  #err { color:var(--warn); min-height:1.2em; }
+  @media (max-width: 800px) { main { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>agentd</h1>
+  <span id="err" class="grow"></span>
+  <a id="viewer" href="#" target="_blank" rel="noopener" hidden>Open viewer</a>
+</header>
+<main>
+  <div>
+    <section>
+      <h2>Access</h2>
+      <input id="token" type="password" placeholder="Bearer token (kept in this browser)" autocomplete="off">
+      <div class="row"><button id="save">Save token</button><button id="forget">Forget</button></div>
+    </section>
+    <section style="margin-top:1.25rem">
+      <h2>Control</h2>
+      <p>Input is held by <span id="lease" class="lease">…</span></p>
+      <input id="reason" placeholder="Reason (optional)">
+      <div class="row">
+        <button id="take" class="primary">Take over</button>
+        <button id="hand">Hand back</button>
+      </div>
+    </section>
+    <section style="margin-top:1.25rem">
+      <h2>Status</h2>
+      <dl id="status"></dl>
+      <div class="row"><button id="snap">Screenshot</button></div>
+      <img id="shot" alt="current screen">
+    </section>
+  </div>
+  <section>
+    <h2>Recent audit entries</h2>
+    <table><thead><tr><th>Time</th><th>Event</th><th>Who</th><th>Detail</th><th>Result</th></tr></thead>
+      <tbody id="audit"></tbody></table>
+  </section>
+</main>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const KEY = "agentd.token";
+$("token").value = localStorage.getItem(KEY) || "";
+
+async function api(method, path, body) {
+  const token = localStorage.getItem(KEY) || "";
+  const res = await fetch(path, {
+    method,
+    headers: { "Authorization": "Bearer " + token, ...(body ? { "Content-Type": "application/json" } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok && data.error) throw new Error(data.error.code + ": " + data.error.message);
+  return data;
+}
+
+function text(el, value) { el.textContent = value; return el; }
+
+function renderStatus(s) {
+  const rows = [
+    ["Display", s.display + (s.display_ok ? "" : " (unavailable)")],
+    ["Screen", s.screen ? s.screen.join(" × ") : "–"],
+    ["Version", s.version],
+    ["Epoch", s.epoch],
+    ["Last frame", s.frame_id],
+    ["Sessions", s.session_count],
+    ["Input busy", s.input_busy ? "yes" : "no"],
+    ["Uptime", Math.round(s.uptime_s / 60) + " min"],
+  ];
+  const dl = $("status");
+  dl.replaceChildren();
+  for (const [k, v] of rows) { dl.append(text(document.createElement("dt"), k), text(document.createElement("dd"), String(v))); }
+  const lease = s.lease || { held: false };
+  const el = $("lease");
+  el.className = "lease " + (lease.held ? "human" : "agent");
+  el.textContent = lease.held ? `${lease.by} (human) since ${lease.since}${lease.reason ? " – " + lease.reason : ""}` : "the agent";
+  $("take").disabled = !!lease.held;
+  $("hand").disabled = !lease.held;
+  if (s.viewer_url) { $("viewer").href = s.viewer_url; $("viewer").hidden = false; }
+}
+
+function detail(e) {
+  if (e.action) return JSON.stringify(e.action);
+  if (e.change) return e.change + (e.reason ? ": " + e.reason : "");
+  const skip = new Set(["ts", "event", "principal", "transport", "result"]);
+  return JSON.stringify(Object.fromEntries(Object.entries(e).filter(([k]) => !skip.has(k))));
+}
+
+function renderAudit(entries) {
+  const body = $("audit");
+  body.replaceChildren();
+  for (const e of entries.slice().reverse()) {
+    const tr = document.createElement("tr");
+    const cells = [e.ts.slice(11, 23), e.event, e.principal || e.by || "", detail(e), e.result || ""];
+    cells.forEach((c, i) => { const td = text(document.createElement("td"), c); if (i === 3) td.className = "mono"; tr.append(td); });
+    body.append(tr);
+  }
+}
+
+async function refresh() {
+  if (!localStorage.getItem(KEY)) { text($("err"), "Paste a token with the observe and takeover scopes."); return; }
+  try {
+    renderStatus(await api("GET", "/v1/status"));
+    renderAudit((await api("GET", "/v1/audit?limit=40")).entries);
+    text($("err"), "");
+  } catch (e) { text($("err"), e.message); }
+}
+
+$("save").onclick = () => { localStorage.setItem(KEY, $("token").value.trim()); refresh(); };
+$("forget").onclick = () => { localStorage.removeItem(KEY); $("token").value = ""; };
+$("take").onclick = async () => {
+  try { await api("POST", "/v1/takeover", { by: "ui", reason: $("reason").value }); } catch (e) { text($("err"), e.message); }
+  refresh();
+};
+$("hand").onclick = async () => {
+  try { await api("DELETE", "/v1/takeover"); } catch (e) { text($("err"), e.message); }
+  refresh();
+};
+$("snap").onclick = async () => {
+  try {
+    const s = await api("POST", "/v1/screenshot", { session: "ui", format: "jpeg" });
+    $("shot").src = `data:${s.mime_type};base64,${s.data}`;
+    $("shot").style.display = "block";
+  } catch (e) { text($("err"), e.message); }
+};
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>

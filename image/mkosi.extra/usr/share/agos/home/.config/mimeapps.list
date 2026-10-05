@@ -1,0 +1,6 @@
+[Default Applications]
+text/html=agos-browser.desktop
+x-scheme-handler/http=agos-browser.desktop
+x-scheme-handler/https=agos-browser.desktop
+x-scheme-handler/about=agos-browser.desktop
+x-scheme-handler/unknown=agos-browser.desktop

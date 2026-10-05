@@ -1,0 +1,26 @@
+# build outputs
+image/mkosi.output/
+image/mkosi.cache/
+image/mkosi.tools/
+image/mkosi.packages/
+image/.cache/
+out/
+*.qcow2
+*.raw
+*.raw.xz
+*.img
+*.iso
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.ruff_cache/
+dist/
+*.egg-info/
+image/mkosi.sandbox/etc/apt/keyrings/
+
+# raw research material (contains details of the maintainer's own machines);
+# the publishable report is docs/research.md
+reports/
+research_notes/

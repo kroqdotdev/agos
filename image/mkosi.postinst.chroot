@@ -1,0 +1,190 @@
+#!/usr/bin/env bash
+# mkosi post-installation script; runs inside the image (chroot) as root after
+# packages and mkosi.extra/ are in place. Everything here must be idempotent:
+# with Incremental=yes it runs on every build on top of the cached tree.
+set -euo pipefail
+
+src="${SRCDIR:-/work/src}/image"
+repo="${SRCDIR:-/work/src}"
+version="${IMAGE_VERSION:-${AGOS_VERSION:-0.0.0}}"
+arch="$(dpkg --print-architecture)"
+say() { echo "agos-postinst: $*"; }
+
+# mkosi copies mkosi.extra/ and mkosi.skeleton/ with the checkout's modes. On a
+# umask 002 checkout that leaves /etc (and every shipped file) group-writable,
+# which e.g. makes Firefox ignore its policies. No group/other write, ever.
+chmod go-w /
+for tree in mkosi.skeleton mkosi.extra; do
+  [[ -d "$src/$tree" ]] || continue
+  (cd "$src/$tree" && find . -mindepth 1 -printf '%P\n') | while IFS= read -r rel; do
+    chmod go-w "/$rel"
+  done
+done
+
+# --- kernel command line --------------------------------------------------
+# Shared by mkosi's UKI and by kernel-install for kernels installed later by
+# unattended-upgrades (initramfs-tools initrd + Type #1 entry), so root= is
+# explicit instead of relying on gpt-auto discovery.
+case "$arch" in
+  amd64) console="console=tty0 console=ttyS0,115200" ;;
+  arm64) console="console=tty0 console=ttyAMA0,115200" ;;
+  *) echo "unsupported arch $arch" >&2; exit 1 ;;
+esac
+# panic=10/oops=panic: reboot instead of hanging; fsck.repair=yes: never ask
+echo "root=PARTLABEL=agos-root rw $console panic=10 oops=panic fsck.repair=yes" > /etc/kernel/cmdline
+cat > /etc/kernel/install.conf <<'EOF'
+# kernel-install: plain Boot Loader Specification entries on the ESP (/efi)
+layout=bls
+EOF
+# same entry token as mkosi's UKI, independent of the per-VM machine-id
+echo agos > /etc/kernel/entry-token
+mkdir -p /efi
+
+# systemd-boot: boot the default entry immediately (no menu, no countdown)
+mkdir -p /efi/loader
+cat > /efi/loader/loader.conf <<'EOF'
+timeout 0
+editor no
+auto-entries no
+auto-firmware no
+EOF
+
+# --- users ------------------------------------------------------------------
+if ! getent group agent >/dev/null; then
+  groupadd --gid 1000 agent
+fi
+if ! getent passwd agent >/dev/null; then
+  useradd --uid 1000 --gid 1000 --groups sudo --create-home --home-dir /home/agent \
+    --shell /bin/bash --comment "agos agent" agent
+fi
+usermod --lock agent           # password locked; SSH keys and sudo only
+usermod --lock root            # root is locked (spec)
+mkdir -p /var/lib/systemd/linger
+touch /var/lib/systemd/linger/agent   # user manager (desktop) starts at boot, no login
+chmod 0440 /etc/sudoers.d/agos
+visudo -cf /etc/sudoers.d/agos >/dev/null
+
+# agent's pre-seeded dotfiles (never overwrite what is already there)
+cp -a --update=none /usr/share/agos/home/. /home/agent/
+# (git does not keep empty directories, so create these explicitly)
+install -d -m 0700 /home/agent/.gnupg /home/agent/.claude
+install -d -m 0755 /home/agent/Downloads /home/agent/work
+chown -R agent:agent /home/agent
+chmod 0700 /home/agent
+chmod 0600 /home/agent/.gnupg/*
+
+# --- zero-touch system tweaks ------------------------------------------------
+# prevents systemd-firstboot's console prompts (locale/keymap/timezone/root
+# password) on the first boot with an uninitialized machine-id
+systemctl mask systemd-firstboot.service
+# prevents any suspend/hibernate path (also disabled in sleep.conf.d)
+systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target \
+  suspend-then-hibernate.target
+# prevents debconf questions from any later package operation
+echo 'debconf debconf/frontend select Noninteractive' | debconf-set-selections
+echo 'debconf debconf/priority select critical' | debconf-set-selections
+
+# Xfce panel: seed the default layout system-wide so xfce4-panel never shows
+# its "Welcome to the first start of the panel" chooser. Plugins whose module
+# is not installed are dropped, which prevents the "plugin unexpectedly left
+# the panel / could not be loaded" dialog.
+python3 - <<'PY'
+import re
+from pathlib import Path
+src = Path("/etc/xdg/xfce4/panel/default.xml")
+dst = Path("/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-panel.xml")
+xml = src.read_text()
+plugins = Path("/usr/share/xfce4/panel/plugins")
+missing = [name for name in set(re.findall(r'<property name="plugin-\d+" type="string" value="([^"]+)"', xml))
+           if not (plugins / f"{name}.desktop").exists()]
+for name in missing:
+    m = re.findall(rf'<property name="(plugin-\d+)" type="string" value="{re.escape(name)}"', xml)
+    for pid in m:
+        xml = re.sub(rf'\s*<property name="{pid}" type="string" value="{re.escape(name)}"\s*/>', "", xml)
+        xml = re.sub(rf'\s*<property name="{pid}" type="string" value="{re.escape(name)}">.*?\n\s*</property>', "", xml, flags=re.S)
+        xml = re.sub(rf'\s*<value type="int" value="{pid.split("-")[1]}"/>', "", xml)
+dst.write_text(xml)
+print("agos-postinst: xfce4-panel.xml seeded" + (f", dropped {missing}" if missing else ""))
+PY
+
+# --- vendor apt repositories inside the image ---------------------------------
+# Same sources and keys the build used (mkosi.sandbox/), so unattended-upgrades
+# keeps Tailscale and Claude Code current.
+install -d -m 0755 /etc/apt/keyrings
+install -m 0644 "$src/mkosi.sandbox/etc/apt/keyrings/tailscale-archive-keyring.gpg" /etc/apt/keyrings/
+install -m 0644 "$src/mkosi.sandbox/etc/apt/sources.list.d/tailscale.sources" /etc/apt/sources.list.d/
+if dpkg-query -W -f='${Status}' claude-code 2>/dev/null | grep -q 'install ok installed'; then
+  install -m 0644 "$src/mkosi.sandbox/etc/apt/keyrings/claude-code.asc" /etc/apt/keyrings/
+  install -m 0644 "$src/mkosi.sandbox/etc/apt/sources.list.d/claude-code.sources" /etc/apt/sources.list.d/
+else
+  rm -f /etc/apt/sources.list.d/claude-code.sources /etc/apt/keyrings/claude-code.asc
+fi
+
+# --- agentd -------------------------------------------------------------------
+# Python venv at /opt/agentd with Debian's site-packages visible (python3-gi).
+# AGOS_WITH_AGENTD: yes = must succeed, auto = install if it builds, no = skip.
+agentd_status="absent"
+install_agentd() {
+  local mode="${AGOS_WITH_AGENTD:-auto}" pkg="$repo/agentd"
+  if [[ "$mode" == no ]]; then
+    agentd_status="skipped"; say "agentd: skipped (AGOS_WITH_AGENTD=no)"; return 0
+  fi
+  if [[ ! -f "$pkg/pyproject.toml" ]]; then
+    agentd_status="absent"
+    say "agentd: $pkg/pyproject.toml not found"
+    [[ "$mode" == yes ]] && return 1
+    return 0
+  fi
+  rm -rf /opt/agentd
+  local pip=(/opt/agentd/bin/pip install --no-cache-dir --disable-pip-version-check --no-input
+             --progress-bar off)
+  local dist="$src/.cache/agentd" wheels=()
+  shopt -s nullglob
+  wheels=("$dist"/agentd-*.whl)
+  shopt -u nullglob
+  install_venv() {
+    python3 -m venv --system-site-packages /opt/agentd || return 1
+    if (( ${#wheels[@]} )) && [[ -f "$dist/requirements.txt" ]]; then
+      # exactly the locked set (uv.lock), hash-checked; venv copies shadow
+      # Debian's python3-* so only python3-gi is taken from the system
+      "${pip[@]}" --require-hashes --no-deps --ignore-installed -r "$dist/requirements.txt" || return 1
+      "${pip[@]}" --no-deps --ignore-installed "${wheels[0]}" || return 1
+      /opt/agentd/bin/pip check || return 1
+    elif (( ${#wheels[@]} )); then
+      "${pip[@]}" --ignore-installed "${wheels[0]}" || return 1
+    else
+      "${pip[@]}" --ignore-installed "$pkg" || return 1
+    fi
+  }
+  if install_venv && /opt/agentd/bin/agentd --help >/dev/null; then
+    agentd_status="installed $(/opt/agentd/bin/pip show agentd 2>/dev/null | awk '/^Version:/{print $2}')"
+    say "agentd: $agentd_status"
+  else
+    rm -rf /opt/agentd
+    agentd_status="failed"
+    say "agentd: build/install FAILED"
+    [[ "$mode" == yes ]] && return 1
+  fi
+  return 0
+}
+install_agentd
+
+# --- build info -----------------------------------------------------------------
+claude_version="$(dpkg-query -W -f='${Version}' claude-code 2>/dev/null || true)"
+kasm_version="$(dpkg-query -W -f='${Version}' kasmvncserver 2>/dev/null || true)"
+kernel="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -n1)"
+python3 - "$version" "$arch" "$agentd_status" "$claude_version" "$kasm_version" "$kernel" <<'PY'
+import json, sys, datetime
+version, arch, agentd, claude, kasm, kernel = sys.argv[1:]
+info = {"version": version, "arch": arch, "agentd": agentd, "claude_code": claude or None,
+        "kasmvnc": kasm, "kernel": kernel,
+        "built": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()}
+open("/usr/lib/agos/build-info.json", "w").write(json.dumps(info, indent=2) + "\n")
+print("agos-postinst: build-info", json.dumps(info))
+PY
+
+mkdir -p /etc/issue.d /usr/share/doc/agos
+if [[ -f "$src/README.md" ]]; then
+  install -m 0644 "$src/README.md" /usr/share/doc/agos/README.md
+fi
+say "done ($version, $arch)"

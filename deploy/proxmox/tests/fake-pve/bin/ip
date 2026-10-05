@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# Fake `ip` covering the queries agos-proxmox.sh makes.
+#   FAKE_BRIDGES      space-separated bridges that exist (default vmbr0)
+#   FAKE_GW4          default IPv4 gateway on vmbr0 (default 192.168.1.1; "none" = no route)
+#   FAKE_HOST_IP4     host address on the bridge (default 192.168.1.10)
+#   FAKE_HOST_PUBLIC  extra global host address (e.g. 203.0.113.5)
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=../lib.sh
+. "$(dirname "$0")/../lib.sh"
+record ip "$@"
+bridges=" ${FAKE_BRIDGES:-vmbr0} "
+gw4=${FAKE_GW4:-192.168.1.1}
+hostip=${FAKE_HOST_IP4:-192.168.1.10}
+dev=""
+args=("$@")
+for i in "${!args[@]}"; do
+	if [[ ${args[i]} == dev ]]; then dev=${args[i + 1]:-}; fi
+done
+case "$*" in
+"-o link show dev "* | "-d -o link show dev "*)
+	if [[ $bridges != *" $dev "* ]]; then
+		echo "Device \"$dev\" does not exist." >&2
+		exit 1
+	fi
+	extra=""
+	[[ $1 == -d ]] && extra=" bridge forward_delay 0 hello_time 200 max_age 2000"
+	printf '5: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT\\    link/ether bc:24:11:00:00:01 brd ff:ff:ff:ff:ff:ff%s\n' "$dev" "$extra"
+	;;
+"-4 route show default dev "*)
+	if [[ $gw4 != none ]]; then printf 'default via %s dev %s proto kernel onlink\n' "$gw4" "$dev"; fi
+	;;
+"-6 route show default dev "*) ;;
+"-4 -o addr show dev "*)
+	printf '5: %s    inet %s/24 scope global %s\\       valid_lft forever preferred_lft forever\n' "$dev" "$hostip" "$dev"
+	;;
+"-o addr show scope global")
+	printf '5: vmbr0    inet %s/24 scope global vmbr0\\       valid_lft forever preferred_lft forever\n' "$hostip"
+	if [[ -n ${FAKE_HOST_PUBLIC:-} ]]; then
+		printf '6: vmbr1    inet %s/24 scope global vmbr1\\       valid_lft forever preferred_lft forever\n' "$FAKE_HOST_PUBLIC"
+	fi
+	;;
+*)
+	echo "fake ip: unsupported: $*" >&2
+	exit 1
+	;;
+esac

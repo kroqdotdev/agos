@@ -1,0 +1,76 @@
+#!/usr/bin/python3
+"""viewer-perm {view|control|status}: switch the KasmVNC viewer's input permission.
+
+agentd runs this as its on_takeover ("control") and on_handback ("view")
+hooks. It calls KasmVNC's owner-only HTTP API
+(https://github.com/kasmtech/KasmVNC/wiki/API, /api/update_user?write=...)
+with the owner credentials agos-firstboot rendered into
+~agent/.config/agos/kasmvnc-api.json. The change applies to connected
+viewers immediately and is persisted in ~/.kasmpasswd by Xvnc.
+
+When the viewer has no basic auth (loopback viewer without VIEWER_PASSWORD)
+KasmVNC has no user to restrict and its API is unavailable, so this is a
+documented no-op: every viewer always has control in that mode.
+"""
+
+import base64
+import json
+import pwd
+import ssl
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
+
+
+def main() -> int:
+    if len(sys.argv) != 2 or sys.argv[1] not in ("view", "control", "status"):
+        print("usage: viewer-perm {view|control|status}", file=sys.stderr)
+        return 2
+    action = sys.argv[1]
+    home = Path(pwd.getpwnam("agent").pw_dir)
+    try:
+        api = json.loads((home / ".config/agos/kasmvnc-api.json").read_text())
+    except (OSError, ValueError) as exc:
+        print(f"viewer-perm: no KasmVNC API settings ({exc})", file=sys.stderr)
+        return 1
+    if not api.get("basic_auth"):
+        print("viewer-perm: viewer runs without basic auth (loopback, no VIEWER_PASSWORD); "
+              "viewers always have control, nothing to switch")
+        return 0
+
+    auth = base64.b64encode(f"{api['owner']}:{api['password']}".encode()).decode()
+    # Trust exactly the viewer's own self-signed certificate (SAN has 127.0.0.1).
+    ctx = None
+    if api["url"].startswith("https:"):
+        ctx = ssl.create_default_context(cafile=str(home / ".config/agos/tls/viewer.crt"))
+    if action == "status":
+        path = "/api/get_users"
+    else:
+        # read stays on in both modes; only keyboard/mouse (write) is switched
+        query = urllib.parse.urlencode({"name": api["viewer"], "read": "true",
+                                        "write": "true" if action == "control" else "false"})
+        path = f"/api/update_user?{query}"
+    req = urllib.request.Request(api["url"].rstrip("/") + path,
+                                 headers={"Authorization": f"Basic {auth}"})
+    try:
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            body = resp.read().decode(errors="replace")
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"viewer-perm: KasmVNC API call failed: {exc}", file=sys.stderr)
+        return 1
+    if action == "status":
+        try:
+            users = {u["user"]: u for u in json.loads(body)}
+            viewer = users.get(api["viewer"], {})
+            print("none" if not viewer.get("read") else "control" if viewer.get("write") else "view")
+        except (ValueError, KeyError, TypeError):
+            print(body)
+        return 0
+    print(f"viewer-perm: {api['viewer']} -> {action}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

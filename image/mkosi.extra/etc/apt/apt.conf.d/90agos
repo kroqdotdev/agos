@@ -1,0 +1,5 @@
+// agos zero-touch apt defaults
+// prevents "Do you want to continue? [Y/n]"
+APT::Get::Assume-Yes "true";
+// prevents dpkg's conffile question ("keep your currently-installed version?")
+Dpkg::Options { "--force-confdef"; "--force-confold"; };

@@ -1,0 +1,3 @@
+# agos: the agent user may run anything as root without a password prompt.
+# The VM (hypervisor) is the security boundary, not this account.
+agent ALL=(ALL:ALL) NOPASSWD: ALL

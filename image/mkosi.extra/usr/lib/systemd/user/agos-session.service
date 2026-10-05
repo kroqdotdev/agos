@@ -1,0 +1,21 @@
+# agos session: XFCE on DISPLAY=:1, no display manager, no login screen.
+[Unit]
+Description=agos desktop session (XFCE on :1)
+ConditionUser=agent
+Requires=agos-display.service
+BindsTo=agos-display.service
+After=agos-display.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+ExecStartPre=/usr/lib/agos/wait-display :1 30
+ExecStart=/usr/lib/agos/agos-session
+Restart=always
+RestartSec=2
+# xfce4-session's children (panel, wm, apps) belong to this unit; stop them all
+KillMode=control-group
+
+[Install]
+WantedBy=default.target

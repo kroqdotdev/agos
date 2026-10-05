@@ -1,0 +1,16 @@
+# Flip /var/lib/agos/state.json to "ready" once the agent's desktop answers
+# (Xvnc, XFCE, the viewer port and agentd's /v1/health), else "degraded".
+# The Proxmox script polls state.json through the guest agent.
+[Unit]
+Description=agos: wait for the desktop and mark the machine ready
+After=agos-firstboot.service user@1000.service
+Wants=user@1000.service
+
+[Service]
+# exec, not oneshot: boot targets do not wait for the desktop
+Type=exec
+RemainAfterExit=yes
+ExecStart=/usr/lib/agos/agos-firstboot --wait-ready --timeout=300
+
+[Install]
+WantedBy=multi-user.target

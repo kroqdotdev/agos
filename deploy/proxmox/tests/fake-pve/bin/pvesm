@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# Fake `pvesm` for the agos-proxmox.sh tests: status, path and free.
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=../lib.sh
+. "$(dirname "$0")/../lib.sh"
+record pvesm "$@"
+maybe_fail pvesm "$@"
+
+case ${1:-} in
+status)
+	want=""
+	[[ ${2:-} == --content ]] && want=$3
+	printf '%-10s %10s %10s %15s %15s %15s %8s\n' Name Type Status 'Total (KiB)' 'Used (KiB)' 'Available (KiB)' '%'
+	while read -r name type content status avail; do
+		if [[ -n $want && ",$content," != *",$want,"* ]]; then continue; fi
+		printf '%-10s %10s %10s %15d %15d %15d %7.2f%%\n' "$name" "$type" "$status" $((avail * 2)) "$avail" "$avail" 50
+	done < <(default_storages)
+	;;
+path)
+	storage_path "$2"
+	;;
+free)
+	p=$(storage_path "$2")
+	rm -f "$p"
+	;;
+*)
+	echo "fake pvesm: unsupported subcommand '${1:-}'" >&2
+	exit 255
+	;;
+esac

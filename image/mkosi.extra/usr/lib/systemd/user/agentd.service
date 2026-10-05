@@ -1,0 +1,22 @@
+# agentd: the agent control daemon (REST/MCP/UI on 127.0.0.1:8765 and
+# $XDG_RUNTIME_DIR/agentd.sock). Installed to /opt/agentd at image build time.
+[Unit]
+Description=agos agentd control daemon
+ConditionUser=agent
+ConditionPathExists=/opt/agentd/bin/agentd
+After=agos-session.service
+StartLimitIntervalSec=0
+
+[Service]
+# agentd sends READY=1 once its listeners are bound and WATCHDOG=1 from its
+# event loop, so a hung (not just crashed) daemon is restarted too.
+Type=notify
+NotifyAccess=main
+WatchdogSec=30
+Environment=DISPLAY=:1
+ExecStart=/opt/agentd/bin/agentd serve
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,25 @@
+[
+   {
+      "hardware-address" : "00:00:00:00:00:00",
+      "ip-addresses" : [
+         { "ip-address" : "127.0.0.1", "ip-address-type" : "ipv4", "prefix" : 8 },
+         { "ip-address" : "::1", "ip-address-type" : "ipv6", "prefix" : 128 }
+      ],
+      "name" : "lo"
+   },
+   {
+      "hardware-address" : "bc:24:11:aa:bb:cc",
+      "ip-addresses" : [
+         { "ip-address" : "192.168.1.57", "ip-address-type" : "ipv4", "prefix" : 24 },
+         { "ip-address" : "fe80::be24:11ff:feaa:bbcc", "ip-address-type" : "ipv6", "prefix" : 64 }
+      ],
+      "name" : "ens18"
+   },
+   {
+      "hardware-address" : "",
+      "ip-addresses" : [
+         { "ip-address" : "100.101.102.103", "ip-address-type" : "ipv4", "prefix" : 32 }
+      ],
+      "name" : "tailscale0"
+   }
+]

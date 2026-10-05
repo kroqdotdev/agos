@@ -1,0 +1,1095 @@
+#!/usr/bin/python3
+"""agos-firstboot: turn configuration inputs into a running agent desktop.
+
+Runs as root from agos-firstboot.service on every boot, before the agent's
+user manager (user@1000.service) starts. Implements docs/spec.md "First boot":
+
+  1. merge config sources (defaults < AGOS filesystem < /etc/agos <
+     systemd credentials), validate, write /run/agos/config.json
+  2. generate missing secrets (AGENTD_TOKEN, VIEWER_PASSWORD when needed)
+  3. render the KasmVNC display/users, agentd config + tokens, the agent's
+     environment, the console banner and the Claude Code pre-seed
+  4. join Tailscale and publish the viewer/agentd with `tailscale serve`
+  5. write /var/lib/agos/state.json
+
+`agos-firstboot --wait-ready` (agos-ready.service) waits for the desktop to
+come up and flips state.json to "ready" (or "degraded").
+
+Python 3 standard library only. Never prints secrets. Never fails the boot:
+problems are recorded in state.json and the journal.
+"""
+
+from __future__ import annotations
+
+import argparse
+import copy
+import datetime as dt
+import hashlib
+import ipaddress
+import json
+import os
+import pwd
+import re
+import secrets
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import tomllib
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+AGENT = "agent"
+LIB = Path("/usr/lib/agos")
+DEFAULTS = LIB / "defaults.toml"
+BUILD_INFO = LIB / "build-info.json"
+ETC = Path("/etc/agos")
+ETC_CONFIG = ETC / "config.toml"
+ETC_SECRETS = ETC / "secrets.env"
+STATE_DIR = Path("/var/lib/agos")
+RUN_DIR = Path("/run/agos")
+DONE = STATE_DIR / "firstboot.done"
+STATE = STATE_DIR / "state.json"
+TS_JOINED = STATE_DIR / "tailscale.joined"
+HOSTNAME_MARK = STATE_DIR / "hostname.set"
+PRIVATE = STATE_DIR / "private"
+OWNER_SECRET = PRIVATE / "kasmvnc-owner"
+AGOS_FS_DIR = STATE_DIR / "agos-fs"
+AGOS_LABEL_DEV = Path("/dev/disk/by-label/AGOS")
+ISSUE = Path("/etc/issue.d/agos.issue")
+AGENTD_BIN = Path("/opt/agentd/bin/agentd")
+AGENTD_PY = Path("/opt/agentd/bin/python")
+IMAGE_HOSTNAMES = ("agos", "localhost", "")
+KASM_OWNER = "agos-admin"
+AGENTD_TOKEN_NAME = "agos-admin"
+AGENT_ENV_SECRETS = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN", "OPENAI_API_KEY")
+KNOWN_SECRETS = ("TS_AUTHKEY", "VIEWER_PASSWORD", "AGENTD_TOKEN") + AGENT_ENV_SECRETS
+DEPTH = 24
+FRAME_RATE = 30
+
+_HOST_RE = re.compile(r"^(?=.{1,63}$)[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$")
+_USER_RE = re.compile(r"^[A-Za-z0-9._-]{1,32}$")
+_ENV_KEY_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_SAFE_VALUE_RE = re.compile(r"^[A-Za-z0-9._~+/=:@%,-]*$")
+
+
+# --------------------------------------------------------------------------
+# small helpers
+
+
+class Run:
+    """Collects problems so a bad input degrades the result instead of the boot."""
+
+    def __init__(self) -> None:
+        self.errors: list[str] = []
+        self.warnings: list[str] = []
+
+    @staticmethod
+    def log(msg: str) -> None:
+        print(f"agos-firstboot: {msg}", flush=True)
+
+    def warn(self, msg: str) -> None:
+        self.warnings.append(msg)
+        self.log(f"warning: {msg}")
+
+    def error(self, msg: str) -> None:
+        self.errors.append(msg)
+        self.log(f"error: {msg}")
+
+
+def now_iso() -> str:
+    return dt.datetime.now(dt.UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def uptime_s() -> float:
+    try:
+        return float(Path("/proc/uptime").read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return -1.0
+
+
+def sh(cmd: list[str], *, timeout: float = 60, input: str | None = None,
+       check: bool = False, env: dict | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(cmd, input=input, capture_output=True, text=True, timeout=timeout,
+                          check=check, env=env, stdin=None if input is not None else subprocess.DEVNULL)
+
+
+def write_file(path: Path, content: str | bytes, mode: int = 0o644,
+               uid: int = 0, gid: int = 0) -> bool:
+    """Atomically write path (only if the content changed). Returns True if written."""
+    data = content.encode() if isinstance(content, str) else content
+    try:
+        if path.read_bytes() == data:
+            os.chown(path, uid, gid)
+            os.chmod(path, mode)
+            return False
+    except OSError:
+        pass
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            os.fchmod(fh.fileno(), mode)
+            os.fchown(fh.fileno(), uid, gid)
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
+    return True
+
+
+def ensure_dir(path: Path, mode: int, uid: int, gid: int) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    os.chown(path, uid, gid)
+    os.chmod(path, mode)
+
+
+def read_toml(path: Path, run: Run, what: str) -> dict:
+    try:
+        with path.open("rb") as fh:
+            return tomllib.load(fh)
+    except FileNotFoundError:
+        return {}
+    except (OSError, tomllib.TOMLDecodeError) as exc:
+        run.error(f"{what} ({path}) is not valid TOML: {exc}; ignored")
+        return {}
+
+
+def parse_toml_text(text: str, run: Run, what: str) -> dict:
+    try:
+        return tomllib.loads(text)
+    except tomllib.TOMLDecodeError as exc:
+        run.error(f"{what} is not valid TOML: {exc}; ignored")
+        return {}
+
+
+def parse_env(text: str) -> dict[str, str]:
+    """KEY=value lines (optional 'export ', optional matching quotes, # comments)."""
+    out: dict[str, str] = {}
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].lstrip()
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or not _ENV_KEY_RE.match(key):
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "'\"":
+            value = value[1:-1]
+        out[key] = value
+    return out
+
+
+def read_env(path: Path) -> dict[str, str]:
+    try:
+        return parse_env(path.read_text())
+    except OSError:
+        return {}
+
+
+def update_env_file(path: Path, set_: dict[str, str] | None = None,
+                    remove: set[str] | frozenset = frozenset(), note: str = "") -> None:
+    """Rewrite KEY=value lines in place (0600 root), keeping comments and order."""
+    set_ = dict(set_ or {})
+    try:
+        lines = path.read_text().splitlines()
+    except OSError:
+        lines = []
+    out: list[str] = []
+    for raw in lines:
+        key = raw.strip().removeprefix("export ").partition("=")[0].strip()
+        if key in remove:
+            continue
+        if key in set_:
+            out.append(f"{key}={set_.pop(key)}")
+            continue
+        out.append(raw)
+    if set_:
+        if note:
+            out.append(f"# {note}")
+        out.extend(f"{k}={v}" for k, v in set_.items())
+    write_file(path, "\n".join(out) + "\n", 0o600)
+
+
+def deep_merge(base: dict, over: dict) -> dict:
+    out = copy.deepcopy(base)
+    for key, value in over.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+def toml_value(value) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    if isinstance(value, str):
+        return json.dumps(value, ensure_ascii=False)
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(toml_value(v) for v in value) + "]"
+    raise TypeError(f"cannot write {type(value).__name__} to TOML")
+
+
+def toml_dumps(data: dict, header: str = "") -> str:
+    """Enough TOML for flat tables, nested tables and arrays of tables."""
+    lines = [header] if header else []
+    tables, arrays = [], []
+    for key, value in data.items():
+        if isinstance(value, dict):
+            tables.append((key, value))
+        elif isinstance(value, list) and value and all(isinstance(v, dict) for v in value):
+            arrays.append((key, value))
+        else:
+            lines.append(f"{key} = {toml_value(value)}")
+    for key, value in tables:
+        lines += ["", f"[{key}]"] + [f"{k} = {toml_value(v)}" for k, v in value.items()]
+    for key, items in arrays:
+        for item in items:
+            lines += ["", f"[[{key}]]"] + [f"{k} = {toml_value(v)}" for k, v in item.items()]
+    return "\n".join(lines).lstrip("\n") + "\n"
+
+
+def read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def ipv4_addresses() -> list[str]:
+    try:
+        res = sh(["ip", "-j", "-4", "addr", "show", "scope", "global"], timeout=5)
+        addrs = []
+        for link in json.loads(res.stdout or "[]"):
+            if link.get("ifname", "").startswith(("tailscale", "docker", "veth", "br-")):
+                continue
+            addrs += [a["local"] for a in link.get("addr_info", []) if a.get("local")]
+        return addrs
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return []
+
+
+def is_loopback(addr: str) -> bool:
+    try:
+        return ipaddress.ip_address(addr).is_loopback
+    except ValueError:
+        return addr == "localhost"
+
+
+# --------------------------------------------------------------------------
+# 1. configuration
+
+
+SCHEMA = {
+    # dotted key: (kind, extra)
+    "hostname": ("hostname", None),
+    "display.width": ("int", (320, 8192)),
+    "display.height": ("int", (240, 8192)),
+    "viewer.listen": ("ip", None),
+    "viewer.port": ("int", (1, 65535)),
+    "viewer.tls": ("enum", ("auto", "on", "off")),
+    "viewer.user": ("user", None),
+    "agentd.listen": ("hostport", None),
+    "tailscale.enabled": ("enum", ("auto", "true", "false")),
+    "tailscale.hostname": ("hostname", None),
+    "tailscale.tags": ("tags", None),
+    "tailscale.serve": ("bool", None),
+    "tailscale.ssh": ("bool", None),
+    "agents.claude_code": ("bool", None),
+}
+PASSTHROUGH_TABLES = ("agentd",)
+
+
+def _check(kind: str, extra, value):
+    """Return the normalized value or raise ValueError."""
+    if kind == "bool":
+        if isinstance(value, bool):
+            return value
+        raise ValueError("expected true or false")
+    if kind == "int":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError("expected an integer")
+        lo, hi = extra
+        if not lo <= value <= hi:
+            raise ValueError(f"expected {lo}..{hi}")
+        return value
+    if kind == "enum":
+        if isinstance(value, bool):
+            value = "on" if value else "off"
+            if "true" in extra:
+                value = "true" if value == "on" else "false"
+        if not isinstance(value, str) or value.lower() not in extra:
+            raise ValueError(f"expected one of {', '.join(extra)}")
+        return value.lower()
+    if kind == "hostname":
+        if not isinstance(value, str) or (value and not _HOST_RE.match(value)):
+            raise ValueError("expected a hostname label (letters, digits, '-')")
+        return value
+    if kind == "user":
+        if not isinstance(value, str) or not _USER_RE.match(value) or value == KASM_OWNER:
+            raise ValueError(f"expected a user name ([A-Za-z0-9._-], not {KASM_OWNER!r})")
+        return value
+    if kind == "ip":
+        if not isinstance(value, str):
+            raise ValueError("expected an IP address string")
+        ipaddress.ip_address(value)
+        return value
+    if kind == "hostport":
+        if not isinstance(value, str):
+            raise ValueError("expected \"host:port\"")
+        host, sep, port = value.rpartition(":")
+        if not sep or not port.isdigit() or not 0 < int(port) < 65536:
+            raise ValueError("expected \"host:port\"")
+        ipaddress.ip_address(host.strip("[]") or "127.0.0.1")
+        return value
+    if kind == "tags":
+        if not isinstance(value, list) or not all(
+                isinstance(t, str) and re.match(r"^tag:[A-Za-z0-9-]+$", t) for t in value):
+            raise ValueError("expected a list like [\"tag:agos\"]")
+        return value
+    raise AssertionError(kind)
+
+
+def validate(merged: dict, defaults: dict, run: Run) -> dict:
+    cfg = copy.deepcopy(defaults)
+    for top, value in merged.items():
+        if isinstance(defaults.get(top), dict):
+            if not isinstance(value, dict):
+                run.error(f"config: [{top}] must be a table; using defaults")
+                continue
+            for key, sub in value.items():
+                dotted = f"{top}.{key}"
+                if dotted not in SCHEMA:
+                    if top in PASSTHROUGH_TABLES:
+                        cfg[top][key] = sub
+                    else:
+                        run.warn(f"config: unknown key {dotted} ignored")
+                    continue
+                try:
+                    cfg[top][key] = _check(*SCHEMA[dotted], sub)
+                except ValueError as exc:
+                    run.error(f"config: {dotted} = {sub!r}: {exc}; using {defaults[top][key]!r}")
+        elif top in SCHEMA:
+            try:
+                cfg[top] = _check(*SCHEMA[top], value)
+            except ValueError as exc:
+                run.error(f"config: {top} = {value!r}: {exc}; using {defaults[top]!r}")
+        else:
+            run.warn(f"config: unknown key {top} ignored")
+    return cfg
+
+
+def import_agos_fs(run: Run) -> list[str]:
+    """Copy config.toml/secrets.env from an AGOS-labelled filesystem (if present)."""
+    if not AGOS_LABEL_DEV.exists():
+        return []
+    copied = []
+    mnt = Path(tempfile.mkdtemp(prefix="agos-fs."))
+    try:
+        res = sh(["mount", "-o", "ro,nosuid,nodev,noexec", str(AGOS_LABEL_DEV), str(mnt)], timeout=30)
+        if res.returncode != 0:
+            run.error(f"AGOS filesystem: mount failed: {res.stderr.strip()}")
+            return []
+        try:
+            ensure_dir(AGOS_FS_DIR, 0o700, 0, 0)
+            for name, mode in (("config.toml", 0o644), ("secrets.env", 0o600)):
+                src = mnt / name
+                if src.is_file():
+                    write_file(AGOS_FS_DIR / name, src.read_bytes(), mode)
+                    copied.append(name)
+        finally:
+            sh(["umount", str(mnt)], timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        run.error(f"AGOS filesystem: {exc}")
+    finally:
+        try:
+            mnt.rmdir()
+        except OSError:
+            pass
+    if copied:
+        run.log(f"AGOS filesystem: copied {', '.join(copied)}")
+    return copied
+
+
+def load_config(run: Run) -> tuple[dict, dict, list[str]]:
+    defaults = read_toml(DEFAULTS, run, "image defaults")
+    import_agos_fs(run)
+    layers: list[tuple[str, dict, dict]] = [
+        ("agos-fs", read_toml(AGOS_FS_DIR / "config.toml", run, "AGOS config.toml"),
+         read_env(AGOS_FS_DIR / "secrets.env")),
+        ("etc", read_toml(ETC_CONFIG, run, "/etc/agos/config.toml"), read_env(ETC_SECRETS)),
+    ]
+    credir = os.environ.get("CREDENTIALS_DIRECTORY")
+    cred_cfg: dict = {}
+    cred_sec: dict = {}
+    if credir:
+        try:
+            cred_cfg = parse_toml_text((Path(credir) / "agos.config").read_text(), run,
+                                       "credential agos.config")
+        except OSError:
+            pass
+        try:
+            cred_sec = parse_env((Path(credir) / "agos.secrets").read_text())
+        except OSError:
+            pass
+    layers.append(("credentials", cred_cfg, cred_sec))
+
+    merged: dict = {}
+    secrets_: dict[str, str] = {}
+    sources = ["defaults"]
+    for name, cfg, sec in layers:
+        if cfg or sec:
+            sources.append(name)
+        merged = deep_merge(merged, cfg)
+        secrets_.update({k: v for k, v in sec.items() if v != ""})
+    for key in secrets_:
+        if key not in KNOWN_SECRETS:
+            run.warn(f"secrets: unknown key {key} (ignored by agos)")
+    return validate(merged, defaults, run), secrets_, sources
+
+
+# --------------------------------------------------------------------------
+# 2./3. secrets and rendering
+
+
+def gen_password(nbytes: int = 18) -> str:
+    return secrets.token_urlsafe(nbytes)
+
+
+def ensure_secrets(cfg: dict, sec: dict, eff: dict, run: Run) -> None:
+    generated: dict[str, str] = {}
+    if not sec.get("AGENTD_TOKEN"):
+        generated["AGENTD_TOKEN"] = "agd_" + secrets.token_urlsafe(32)
+    if eff["viewer_auth"] and not sec.get("VIEWER_PASSWORD"):
+        generated["VIEWER_PASSWORD"] = gen_password()
+    if generated:
+        sec.update(generated)
+        update_env_file(ETC_SECRETS, generated, note=f"generated by agos-firstboot {now_iso()}")
+        run.log(f"generated {', '.join(sorted(generated))} (stored in {ETC_SECRETS})")
+    if ETC_SECRETS.exists():
+        # cloud-init or an admin may have written it with looser permissions
+        os.chown(ETC_SECRETS, 0, 0)
+        os.chmod(ETC_SECRETS, 0o600)
+
+
+def kasm_hash(password: str) -> str:
+    # Same as kasmvncpasswd: SHA-256 crypt with the fixed salt "kasm".
+    res = sh(["openssl", "passwd", "-5", "-salt", "kasm", "-stdin"], input=password + "\n",
+             timeout=20, check=True)
+    return res.stdout.strip()
+
+
+def ensure_viewer_cert(home: Path, uid: int, gid: int, hostname: str, ips: list[str],
+                       run: Run) -> tuple[Path, Path]:
+    tls = home / ".config/agos/tls"
+    ensure_dir(tls, 0o700, uid, gid)
+    crt, key = tls / "viewer.crt", tls / "viewer.key"
+    if crt.exists() and key.exists():
+        return crt, key
+    san = [f"DNS:{hostname}", "DNS:localhost", "IP:127.0.0.1"] + [f"IP:{ip}" for ip in ips]
+    try:
+        sh(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+            "-subj", f"/CN={hostname}", "-addext", "subjectAltName=" + ",".join(san),
+            "-keyout", str(key), "-out", str(crt)], timeout=60, check=True)
+        os.chown(key, uid, gid)
+        os.chmod(key, 0o600)
+        os.chown(crt, uid, gid)
+        os.chmod(crt, 0o644)
+        run.log("generated a self-signed viewer certificate")
+    except (OSError, subprocess.SubprocessError) as exc:
+        run.error(f"viewer certificate: {exc}")
+    return crt, key
+
+
+def agentd_supported_keys(run: Run) -> set[str] | None:
+    """Ask the installed agentd which config keys it accepts (it rejects unknown ones)."""
+    if not AGENTD_PY.exists():
+        return None
+    code = ("import dataclasses, json, agentd.config as c;"
+            "print(json.dumps([f.name for f in dataclasses.fields(c.Config)]))")
+    try:
+        res = sh([str(AGENTD_PY), "-c", code], timeout=30)
+        if res.returncode == 0:
+            return set(json.loads(res.stdout))
+        run.warn(f"agentd: could not list config keys: {res.stderr.strip()[-200:]}")
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        run.warn(f"agentd: could not list config keys: {exc}")
+    return None
+
+
+def render_agent(cfg: dict, sec: dict, eff: dict, run: Run) -> None:
+    pw = pwd.getpwnam(AGENT)
+    uid, gid, home = pw.pw_uid, pw.pw_gid, Path(pw.pw_dir)
+    conf = home / ".config"
+    for d, mode in ((conf, 0o755), (conf / "agos", 0o700), (home / ".vnc", 0o700),
+                    (conf / "agentd", 0o700), (home / ".local", 0o755),
+                    (home / ".local/state", 0o755), (home / ".local/state/agentd", 0o700),
+                    (conf / "environment.d", 0o700)):
+        ensure_dir(d, mode, uid, gid)
+
+    # Restore pre-seeded dotfiles that went missing (e.g. a recreated home).
+    skel = Path("/usr/share/agos/home")
+    if skel.is_dir():
+        for src in skel.rglob("*"):
+            dst = home / src.relative_to(skel)
+            if src.is_dir():
+                if not dst.exists():
+                    ensure_dir(dst, 0o700 if src.name in (".gnupg", ".claude") else 0o755, uid, gid)
+            elif not dst.exists():
+                write_file(dst, src.read_bytes(), 0o600 if ".gnupg" in dst.parts else 0o644, uid, gid)
+
+    # --- KasmVNC display -------------------------------------------------
+    crt, key = ensure_viewer_cert(home, uid, gid, eff["hostname"], eff["ipv4"], run)
+    v = cfg["viewer"]
+    display_env = {
+        "WIDTH": cfg["display"]["width"], "HEIGHT": cfg["display"]["height"], "DEPTH": DEPTH,
+        "LISTEN": v["listen"], "PORT": v["port"], "SSL_ONLY": int(eff["tls"]),
+        "BASIC_AUTH": int(eff["viewer_auth"]), "FRAME_RATE": FRAME_RATE,
+        "CERT": crt, "KEY": key,
+    }
+    write_file(conf / "agos/display.env",
+               "# rendered by agos-firstboot from /etc/agos/config.toml; do not edit\n"
+               + "".join(f"{k}={val}\n" for k, val in display_env.items()), 0o644, uid, gid)
+
+    ensure_dir(PRIVATE, 0o700, 0, 0)
+    owner_pw = OWNER_SECRET.read_text().strip() if OWNER_SECRET.exists() else ""
+    if not owner_pw:
+        owner_pw = gen_password(24)
+        write_file(OWNER_SECRET, owner_pw + "\n", 0o600)
+    # KasmVNC 1.5 permissions: r = see the screen, w = mouse/keyboard,
+    # o = owner (may use the HTTP API). Viewers start view-only when agentd
+    # arbitrates control (takeover adds w through viewer-perm); without agentd
+    # they get control.
+    viewer_perm = "r" if (eff["viewer_auth"] and eff["agentd_installed"]) else "rw"
+    viewer_pw = sec.get("VIEWER_PASSWORD") or gen_password()
+    kasmpasswd = (f"{v['user']}:{kasm_hash(viewer_pw)}:{viewer_perm}\n"
+                  f"{KASM_OWNER}:{kasm_hash(owner_pw)}:rwo\n")
+    write_file(home / ".kasmpasswd", kasmpasswd, 0o600, uid, gid)
+    api_host = "127.0.0.1" if v["listen"] in ("0.0.0.0", "::") or is_loopback(v["listen"]) else v["listen"]
+    if ":" in api_host:
+        api_host = f"[{api_host}]"
+    api = {"url": f"{'https' if eff['tls'] else 'http'}://{api_host}:{v['port']}",
+           "owner": KASM_OWNER, "password": owner_pw, "viewer": v["user"],
+           "basic_auth": eff["viewer_auth"], "initial": "view" if viewer_perm == "r" else "control"}
+    write_file(conf / "agos/kasmvnc-api.json", json.dumps(api, indent=2) + "\n", 0o600, uid, gid)
+
+    render_agentd_config(cfg, eff, run)
+
+    tokens_path = conf / "agentd/tokens.toml"
+    existing = read_toml(tokens_path, run, "agentd tokens.toml").get("token", [])
+    digest = hashlib.sha256(sec["AGENTD_TOKEN"].encode()).hexdigest()
+    created = now_iso()
+    kept = []
+    for entry in existing if isinstance(existing, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        if entry.get("name") == AGENTD_TOKEN_NAME:
+            if entry.get("sha256") == digest and entry.get("created"):
+                created = str(entry["created"])
+            continue
+        kept.append(entry)
+    tokens = [{"name": AGENTD_TOKEN_NAME, "sha256": digest, "scopes": ["admin"], "created": created}] + kept
+    write_file(tokens_path, toml_dumps({"token": tokens},
+               "# agentd bearer tokens (sha256 of the token). agos-admin = AGENTD_TOKEN from /etc/agos/secrets.env"),
+               0o600, uid, gid)
+
+    # --- user environment -------------------------------------------------
+    env_lines = []
+    for name in AGENT_ENV_SECRETS:
+        val = sec.get(name)
+        if not val:
+            continue
+        if _SAFE_VALUE_RE.match(val):
+            env_lines.append(f"{name}={val}")
+        elif "'" not in val and "\n" not in val and "$" not in val:
+            env_lines.append(f"{name}='{val}'")
+        else:
+            run.error(f"secrets: {name} contains characters that cannot be exported safely; skipped")
+    env_file = conf / "environment.d/50-agos-secrets.conf"
+    if env_lines:
+        write_file(env_file, "# rendered by agos-firstboot from /etc/agos/secrets.env\n"
+                   + "\n".join(env_lines) + "\n", 0o600, uid, gid)
+    else:
+        env_file.unlink(missing_ok=True)
+
+    # --- Claude Code --------------------------------------------------------
+    if cfg["agents"]["claude_code"]:
+        preseed_claude(home, uid, gid, sec, eff, run)
+
+
+def render_agentd_config(cfg: dict, eff: dict, run: Run) -> None:
+    """~agent/.config/agentd/config.toml; only keys the installed agentd accepts."""
+    pw = pwd.getpwnam(AGENT)
+    uid, gid, home = pw.pw_uid, pw.pw_gid, Path(pw.pw_dir)
+    agentd_cfg = {
+        "display": ":1",
+        "listen": cfg["agentd"]["listen"],
+        "socket": f"/run/user/{uid}/agentd.sock",
+        "audit_log": str(home / ".local/state/agentd/audit.jsonl"),
+        "max_image_long_edge": 2576,
+        "max_image_pixels": 3750000,
+        "default_format": "png",
+        "settle_ms": 300,
+        "settle_timeout_ms": 3000,
+        "on_takeover": ["/usr/lib/agos/viewer-perm", "control"],
+        "on_handback": ["/usr/lib/agos/viewer-perm", "view"],
+        # link shown in agentd's /ui: the tailnet URL when published, else direct
+        "viewer_url": eff.get("public_viewer_url") or eff["viewer_url"],
+        # in-VM `agentd mcp` (Claude Code's "desktop" server) goes through the
+        # running server, so it cannot bypass a human takeover
+        "mcp_mode": "remote",
+    }
+    for key_, val in cfg["agentd"].items():
+        if key_ != "listen":
+            agentd_cfg[key_] = val
+    supported = agentd_supported_keys(run)
+    if supported is not None:
+        dropped = sorted(k for k in agentd_cfg if k not in supported)
+        if dropped:
+            run.warn(f"agentd: installed version does not know {', '.join(dropped)}; not rendered")
+        agentd_cfg = {k: val for k, val in agentd_cfg.items() if k in supported}
+    try:
+        write_file(home / ".config/agentd/config.toml",
+                   toml_dumps(agentd_cfg, "# rendered by agos-firstboot; edit /etc/agos/config.toml [agentd]"),
+                   0o600, uid, gid)
+    except TypeError as exc:
+        run.error(f"agentd: cannot render config: {exc}")
+
+
+def preseed_claude(home: Path, uid: int, gid: int, sec: dict, eff: dict, run: Run) -> None:
+    """Merge (never replace) the keys that keep Claude Code from prompting."""
+    ensure_dir(home / ".claude", 0o700, uid, gid)
+    settings_path = home / ".claude/settings.json"
+    settings = read_json(settings_path)
+    perms = settings.get("permissions") if isinstance(settings.get("permissions"), dict) else {}
+    # prevents per-tool permission prompts (VM-contained agent)
+    perms["defaultMode"] = "bypassPermissions"
+    settings["permissions"] = perms
+    # prevents the one-time bypass-mode warning dialog
+    settings["skipDangerousModePermissionPrompt"] = True
+    # prevents the first-run theme picker
+    settings.setdefault("theme", "dark")
+    write_file(settings_path, json.dumps(settings, indent=2) + "\n", 0o600, uid, gid)
+
+    state_path = home / ".claude.json"
+    state = read_json(state_path)
+    # prevents the onboarding flow (undocumented key, anthropics/claude-code#46259)
+    state["hasCompletedOnboarding"] = True
+    projects = state.get("projects") if isinstance(state.get("projects"), dict) else {}
+    for proj in (str(home), str(home / "work")):
+        entry = projects.get(proj) if isinstance(projects.get(proj), dict) else {}
+        # prevents the "Do you trust the files in this folder?" dialog
+        entry["hasTrustDialogAccepted"] = True
+        projects[proj] = entry
+    state["projects"] = projects
+    servers = state.get("mcpServers") if isinstance(state.get("mcpServers"), dict) else {}
+    if eff["agentd_installed"]:
+        servers["desktop"] = {"type": "stdio", "command": str(AGENTD_BIN), "args": ["mcp"], "env": {}}
+    else:
+        servers.pop("desktop", None)
+    state["mcpServers"] = servers
+    key = sec.get("ANTHROPIC_API_KEY", "")
+    if key:
+        # prevents "Do you want to use this API key?" (Claude Code stores the last 20 chars)
+        resp = state.get("customApiKeyResponses") if isinstance(state.get("customApiKeyResponses"), dict) else {}
+        approved = [a for a in resp.get("approved", []) if isinstance(a, str)]
+        if key[-20:] not in approved:
+            approved.append(key[-20:])
+        resp["approved"] = approved
+        resp["rejected"] = [r for r in resp.get("rejected", []) if r != key[-20:]]
+        state["customApiKeyResponses"] = resp
+    write_file(state_path, json.dumps(state, indent=2) + "\n", 0o600, uid, gid)
+
+
+# --------------------------------------------------------------------------
+# hostname, Tailscale, banner, state
+
+
+def apply_hostname(cfg: dict, run: Run) -> str:
+    current = socket.gethostname()
+    want = cfg.get("hostname") or ""
+    if not want or want == current:
+        return current
+    mark = HOSTNAME_MARK.read_text().strip() if HOSTNAME_MARK.exists() else None
+    if current not in IMAGE_HOSTNAMES and current != mark:
+        run.log(f"hostname {current!r} was set by cloud-init or an admin; config hostname {want!r} not applied")
+        return current
+    res = sh(["hostnamectl", "set-hostname", want], timeout=30)
+    if res.returncode != 0:
+        write_file(Path("/etc/hostname"), want + "\n")
+        sh(["hostname", want], timeout=10)
+    try:
+        hosts = Path("/etc/hosts").read_text().splitlines()
+        hosts = [h for h in hosts if not h.startswith("127.0.1.1")]
+        hosts.insert(1 if hosts else 0, f"127.0.1.1\t{want}")
+        write_file(Path("/etc/hosts"), "\n".join(hosts) + "\n")
+    except OSError as exc:
+        run.warn(f"/etc/hosts: {exc}")
+    write_file(HOSTNAME_MARK, want + "\n")
+    run.log(f"hostname set to {want}")
+    return want
+
+
+def tailscale_status() -> dict:
+    try:
+        res = sh(["tailscale", "status", "--json"], timeout=15)
+        return json.loads(res.stdout) if res.stdout.strip().startswith("{") else {}
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return {}
+
+
+def setup_tailscale(cfg: dict, sec: dict, eff: dict, run: Run) -> dict:
+    ts = cfg["tailscale"]
+    key = sec.get("TS_AUTHKEY", "")
+    mode = ts["enabled"]
+    enabled = mode == "true" or (mode == "auto" and bool(key or TS_JOINED.exists()))
+    info: dict = {"enabled": enabled, "state": "disabled", "serve": False, "urls": []}
+    if not shutil.which("tailscale"):
+        if enabled:
+            run.error("tailscale: not installed")
+        return info
+    if not enabled:
+        if sh(["systemctl", "is-enabled", "--quiet", "tailscaled.service"], timeout=10).returncode == 0:
+            sh(["systemctl", "disable", "--now", "tailscaled.service"], timeout=60)
+            run.log("tailscale: disabled")
+        return info
+
+    res = sh(["systemctl", "enable", "--now", "tailscaled.service"], timeout=90)
+    if res.returncode != 0:
+        run.error(f"tailscale: cannot start tailscaled: {res.stderr.strip()}")
+        return info
+    st: dict = {}
+    for _ in range(30):
+        st = tailscale_status()
+        if st.get("BackendState") not in (None, "", "NoState"):
+            break
+        time.sleep(0.5)
+
+    ts_host = ts["hostname"] or eff["hostname"]
+    if st.get("BackendState") != "Running":
+        if not key:
+            run.error("tailscale: enabled but not logged in and no TS_AUTHKEY")
+            info["state"] = st.get("BackendState", "unknown")
+            return info
+        authkey = key
+        if authkey.startswith("tskey-client-") and "?" not in authkey:
+            # OAuth client secret: pre-authorized, non-ephemeral tagged node (spec)
+            authkey += "?preauthorized=true&ephemeral=false"
+        keyfile = RUN_DIR / "ts-authkey"
+        write_file(keyfile, authkey, 0o600)
+        cmd = ["tailscale", "up", "--reset", f"--auth-key=file:{keyfile}", f"--hostname={ts_host}",
+               f"--ssh={str(ts['ssh']).lower()}", "--timeout=60s"]
+        if ts["tags"]:
+            cmd.append(f"--advertise-tags={','.join(ts['tags'])}")
+        try:
+            res = sh(cmd, timeout=90)
+            ok, err = res.returncode == 0, (res.stderr or res.stdout).strip()
+        except subprocess.TimeoutExpired:
+            ok, err = False, "timed out"
+        finally:
+            keyfile.unlink(missing_ok=True)
+        if not ok:
+            run.error(f"tailscale up failed: {err[-300:]}")
+            info["state"] = tailscale_status().get("BackendState", "unknown")
+            return info
+        write_file(TS_JOINED, now_iso() + "\n")
+        run.log(f"tailscale: joined as {ts_host}")
+        if key.startswith("tskey-auth-"):
+            # one-off auth keys are useless after the join; OAuth client secrets are kept
+            update_env_file(ETC_SECRETS, remove={"TS_AUTHKEY"})
+            if (AGOS_FS_DIR / "secrets.env").exists():
+                update_env_file(AGOS_FS_DIR / "secrets.env", remove={"TS_AUTHKEY"})
+            run.log("tailscale: removed the used auth key from disk "
+                    "(cloud-init keeps its own copy of user-data in /var/lib/cloud)")
+    else:
+        res = sh(["tailscale", "set", f"--hostname={ts_host}", f"--ssh={str(ts['ssh']).lower()}"], timeout=30)
+        if res.returncode != 0:
+            run.warn(f"tailscale set: {res.stderr.strip()[-200:]}")
+
+    # tailscale serve: viewer on :443, agentd on its own port. stdin is closed and
+    # the call is time-bounded, so a tailnet without HTTPS/Serve enabled cannot
+    # leave us waiting at "enable Serve at <url>".
+    try:
+        sh(["tailscale", "serve", "reset"], timeout=30)
+        if ts["serve"]:
+            scheme = "https+insecure" if eff["tls"] else "http"
+            agentd_port = cfg["agentd"]["listen"].rpartition(":")[2]
+            for port, target in (("443", f"{scheme}://127.0.0.1:{cfg['viewer']['port']}"),
+                                 (agentd_port, f"http://127.0.0.1:{agentd_port}")):
+                res = sh(["tailscale", "serve", "--bg", "--yes", f"--https={port}", target], timeout=45)
+                if res.returncode != 0:
+                    run.error(f"tailscale serve :{port}: {(res.stderr or res.stdout).strip()[-300:]}")
+                    break
+            else:
+                info["serve"] = True
+    except subprocess.TimeoutExpired:
+        run.error("tailscale serve timed out (is HTTPS/Serve enabled for the tailnet?)")
+
+    st = tailscale_status()
+    info["state"] = st.get("BackendState", "unknown")
+    dns = (st.get("Self") or {}).get("DNSName", "").rstrip(".")
+    info["dns_name"] = dns
+    info["ips"] = (st.get("Self") or {}).get("TailscaleIPs", [])
+    if dns and info["serve"]:
+        info["urls"] = [f"https://{dns}/", f"https://{dns}:{cfg['agentd']['listen'].rpartition(':')[2]}/"]
+    return info
+
+
+def viewer_url(cfg: dict, eff: dict) -> str:
+    v = cfg["viewer"]
+    scheme = "https" if eff["tls"] else "http"
+    if is_loopback(v["listen"]):
+        host = "127.0.0.1"
+    elif v["listen"] in ("0.0.0.0", "::"):
+        host = (eff["ipv4"] or [eff["hostname"]])[0]
+    else:
+        host = v["listen"]
+    return f"{scheme}://{host}:{v['port']}/"
+
+
+def render_issue(state: dict) -> None:
+    def esc(text: str) -> str:
+        return str(text).replace("\\", "\\\\")
+    v = state.get("viewer", {})
+    ts = state.get("tailscale", {})
+    lines = [
+        f"agos {esc(state.get('version', '?'))} on \\n - state: {esc(state.get('state', '?'))}",
+        "  IPv4:      \\4",
+        f"  SSH:       ssh agent@{esc((state.get('ipv4') or ['<ip>'])[0])}",
+        f"  Viewer:    {esc(v.get('url', '?'))}"
+        + (" (loopback: ssh -L or Tailscale)" if v.get("loopback") else "")
+        + (f" user {esc(v.get('user'))}" if v.get("auth") else ""),
+    ]
+    if ts.get("enabled"):
+        urls = ts.get("urls") or []
+        lines.append(f"  Tailscale: {esc(ts.get('state', '?'))} {esc(' '.join(urls))}".rstrip())
+    lines.append(f"  agentd:    {esc(state.get('agentd', {}).get('listen', '?'))}"
+                 + ("" if state.get("agentd", {}).get("installed") else " (not installed)"))
+    if state.get("errors"):
+        lines.append(f"  Problems:  {len(state['errors'])} - run 'agos status' after logging in")
+    write_file(ISSUE, "\n".join(lines) + "\n\n")
+    # agetty re-reads issue files on SIGHUP/--reload; harmless if none is running
+    sh(["agetty", "--reload"], timeout=5) if shutil.which("agetty") else None
+
+
+def build_info() -> dict:
+    return read_json(BUILD_INFO)
+
+
+def write_state(state: dict) -> None:
+    state["updated"] = now_iso()
+    write_file(STATE, json.dumps(state, indent=2, sort_keys=True) + "\n", 0o644)
+
+
+# --------------------------------------------------------------------------
+# main modes
+
+
+def apply(run: Run) -> int:
+    started = time.monotonic()
+    first = not DONE.exists()
+    for d, mode in ((ETC, 0o755), (STATE_DIR, 0o755), (RUN_DIR, 0o755)):
+        ensure_dir(d, mode, 0, 0)
+    info = build_info()
+    run.log(f"{'first boot' if first else 'apply'} (agos {info.get('version', '?')})")
+
+    if first and not Path("/etc/ssl/private/ssl-cert-snakeoil.key").exists() and shutil.which("make-ssl-cert"):
+        # removed from the image so clones never share it; some packages expect it
+        sh(["make-ssl-cert", "generate-default-snakeoil", "--force-overwrite"], timeout=60)
+
+    cfg, sec, sources = load_config(run)
+    hostname = apply_hostname(cfg, run)
+    loop = is_loopback(cfg["viewer"]["listen"])
+    ts_cfg = cfg["tailscale"]
+    ts_on = ts_cfg["enabled"] == "true" or (
+        ts_cfg["enabled"] == "auto" and bool(sec.get("TS_AUTHKEY") or TS_JOINED.exists()))
+    eff = {
+        "hostname": hostname,
+        "ipv4": ipv4_addresses(),
+        "tls": cfg["viewer"]["tls"] == "on" or (cfg["viewer"]["tls"] == "auto" and not loop),
+        # Basic auth whenever the viewer is reachable from outside the VM:
+        # LAN mode, or loopback published on the tailnet by `tailscale serve`.
+        "viewer_auth": bool(sec.get("VIEWER_PASSWORD")) or not loop or (ts_on and ts_cfg["serve"]),
+        "agentd_installed": AGENTD_BIN.exists(),
+    }
+    eff["viewer_url"] = viewer_url(cfg, eff)
+    ensure_secrets(cfg, sec, eff, run)
+
+    try:
+        RUN_DIR.mkdir(parents=True, exist_ok=True)
+        write_file(RUN_DIR / "config.json", json.dumps(cfg, indent=2, sort_keys=True) + "\n", 0o644)
+    except OSError as exc:
+        run.error(f"/run/agos/config.json: {exc}")
+
+    try:
+        render_agent(cfg, sec, eff, run)
+    except (KeyError, OSError, subprocess.SubprocessError) as exc:
+        run.error(f"render: {exc!r}")
+
+    ts_info: dict = {"enabled": False}
+    try:
+        ts_info = setup_tailscale(cfg, sec, eff, run)
+    except (OSError, subprocess.SubprocessError) as exc:
+        run.error(f"tailscale: {exc!r}")
+    if ts_info.get("urls"):
+        eff["public_viewer_url"] = ts_info["urls"][0]
+        try:
+            render_agentd_config(cfg, eff, run)
+        except (KeyError, OSError) as exc:
+            run.error(f"render agentd: {exc!r}")
+
+    prev = read_json(STATE)
+    state = {
+        # agos-ready.service turns this into "ready" or "error" once the desktop answers
+        "state": "starting",
+        "version": info.get("version", ""),
+        "arch": info.get("arch", ""),
+        "build": info,
+        "hostname": hostname,
+        "ipv4": eff["ipv4"],
+        "first_boot": prev.get("first_boot") or now_iso(),
+        "boot_id": Path("/proc/sys/kernel/random/boot_id").read_text().strip(),
+        "config_sources": sources,
+        "display": {"width": cfg["display"]["width"], "height": cfg["display"]["height"], "depth": DEPTH},
+        "viewer": {"url": eff["viewer_url"], "listen": cfg["viewer"]["listen"], "port": cfg["viewer"]["port"],
+                   "tls": eff["tls"], "auth": eff["viewer_auth"], "user": cfg["viewer"]["user"],
+                   "loopback": loop},
+        "agentd": {"listen": cfg["agentd"]["listen"], "installed": eff["agentd_installed"]},
+        "tailscale": ts_info,
+        "agents": {"claude_code": cfg["agents"]["claude_code"] and bool(shutil.which("claude"))},
+        "errors": run.errors,
+        "warnings": run.warnings,
+        "firstboot_seconds": round(time.monotonic() - started, 2),
+        "firstboot_uptime": round(uptime_s(), 2),
+    }
+    write_state(state)
+    render_issue(state)
+    if first:
+        write_file(DONE, now_iso() + "\n")
+    run.log(f"done in {state['firstboot_seconds']}s, state {state['state']}, "
+            f"{len(run.errors)} error(s), {len(run.warnings)} warning(s)")
+    return 0
+
+
+def agent_env() -> tuple[list[str], dict]:
+    pw = pwd.getpwnam(AGENT)
+    env = {"HOME": pw.pw_dir, "USER": AGENT, "LOGNAME": AGENT, "PATH": "/usr/sbin:/usr/bin:/sbin:/bin",
+           "XDG_RUNTIME_DIR": f"/run/user/{pw.pw_uid}",
+           "DBUS_SESSION_BUS_ADDRESS": f"unix:path=/run/user/{pw.pw_uid}/bus",
+           "DISPLAY": ":1", "XAUTHORITY": f"{pw.pw_dir}/.Xauthority"}
+    return ["/usr/sbin/runuser", "-u", AGENT, "--"], env
+
+
+def checks(state: dict) -> dict:
+    prefix, env = agent_env()
+    out: dict[str, bool] = {}
+    units = ["agos-display.service", "agos-session.service"]
+    if state.get("agentd", {}).get("installed"):
+        units.append("agentd.service")
+    for unit in units:
+        try:
+            res = sh(prefix + ["systemctl", "--user", "is-active", "--quiet", unit], timeout=10, env=env)
+            out[unit] = res.returncode == 0
+        except (OSError, subprocess.SubprocessError):
+            out[unit] = False
+    try:
+        out["x11"] = sh(prefix + ["xdpyinfo", "-display", ":1"], timeout=10, env=env).returncode == 0
+        out["xfce4-panel"] = sh(["pgrep", "-u", AGENT, "-x", "xfce4-panel"], timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        out["x11"] = out["xfce4-panel"] = False
+    port = int(state.get("viewer", {}).get("port", 8444))
+    host = "127.0.0.1" if state.get("viewer", {}).get("listen") in ("0.0.0.0", "::", "127.0.0.1", None) \
+        else state["viewer"]["listen"]
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            out["viewer"] = True
+    except OSError:
+        out["viewer"] = False
+    if state.get("agentd", {}).get("installed"):
+        listen = state["agentd"].get("listen", "127.0.0.1:8765")
+        h, _, p = listen.rpartition(":")
+        h = h.strip("[]")
+        h = "127.0.0.1" if h in ("", "0.0.0.0") else h
+        try:
+            with urllib.request.urlopen(f"http://{h}:{p}/v1/health", timeout=3) as resp:
+                out["agentd_health"] = resp.status == 200
+        except (OSError, urllib.error.URLError, ValueError):
+            out["agentd_health"] = False
+    return out
+
+
+def wait_ready(run: Run, timeout: float) -> int:
+    deadline = time.monotonic() + timeout
+    state = read_json(STATE)
+    result: dict = {}
+    while True:
+        try:
+            result = checks(state)
+        except Exception as exc:  # keep polling; report at the deadline
+            result = {"checks": False}
+            run.warn(f"readiness check failed: {exc!r}")
+        if all(result.values()):
+            break
+        if time.monotonic() > deadline:
+            break
+        time.sleep(2)
+    state = read_json(STATE) or state
+    ok = all(result.values())
+    state["checks"] = result
+    state["ready_uptime"] = round(uptime_s(), 2)
+    if not ok:
+        failed = [k for k, v in result.items() if not v]
+        state.setdefault("errors", []).append(f"desktop not ready after {int(timeout)}s: {', '.join(failed)}")
+    # Spec: "ready" or "error" (+ "message"); "starting" only while waiting.
+    if ok and not state.get("errors"):
+        state["state"] = "ready"
+        state.pop("message", None)
+    else:
+        state["state"] = "error"
+        state["message"] = "; ".join(state.get("errors", []))[:500]
+    write_state(state)
+    render_issue(state)
+    run.log(f"state {state['state']} at {state['ready_uptime']}s after boot ({json.dumps(result)})")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--wait-ready", action="store_true",
+                    help="wait for the desktop stack and mark state.json ready/degraded")
+    ap.add_argument("--timeout", type=float, default=300, help="--wait-ready timeout (seconds)")
+    args = ap.parse_args()
+    if os.geteuid() != 0:
+        print("agos-firstboot: must run as root", file=sys.stderr)
+        return 1
+    run = Run()
+    if args.wait_ready:
+        return wait_ready(run, args.timeout)
+    try:
+        return apply(run)
+    except Exception as exc:  # last resort: record and never fail the boot
+        run.error(f"unexpected: {exc!r}")
+        try:
+            state = read_json(STATE)
+            state.update({"state": "error", "errors": run.errors, "message": "; ".join(run.errors)[:500]})
+            write_state(state)
+        except OSError:
+            pass
+        return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

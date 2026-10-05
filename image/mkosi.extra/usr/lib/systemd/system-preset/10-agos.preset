@@ -1,0 +1,22 @@
+# agos: explicit unit policy. mkosi runs "systemctl preset-all", which enables
+# every unit not listed in a preset, so anything unwanted is disabled here.
+enable agos-firstboot.service
+enable agos-ssh-keygen.service
+enable ssh.service
+disable ssh.socket
+# enabled by agos-firstboot only when Tailscale is configured (spec)
+disable tailscaled.service
+enable qemu-guest-agent.service
+enable systemd-networkd.service
+enable systemd-networkd-wait-online.service
+enable systemd-resolved.service
+enable systemd-timesyncd.service
+enable unattended-upgrades.service
+enable apt-daily.timer
+enable apt-daily-upgrade.timer
+enable fstrim.timer
+# the system user unit KasmVNC ships; agos runs Xvnc via agos-display instead
+disable kasmvncserver@.service
+disable systemd-homed.service
+disable systemd-homed-activate.service
+enable agos-ready.service

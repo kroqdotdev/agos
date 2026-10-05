@@ -1,0 +1,6 @@
+# agos: never autostart user-dirs-update-gtk in the agent's session (screen lockers, power
+# managers, keyring and polkit agents, updaters and tray nags are dialog sources).
+[Desktop Entry]
+Type=Application
+Name=user-dirs-update-gtk
+Hidden=true

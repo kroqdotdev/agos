@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake `dpkg --print-architecture`: FAKE_ARCH (default amd64).
+set -euo pipefail
+if [[ ${1:-} == --print-architecture ]]; then
+	printf '%s\n' "${FAKE_ARCH:-amd64}"
+	exit 0
+fi
+exec /usr/bin/dpkg "$@"

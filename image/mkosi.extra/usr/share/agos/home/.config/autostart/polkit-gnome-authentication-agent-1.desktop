@@ -1,0 +1,6 @@
+# agos: never autostart polkit-gnome-authentication-agent-1 in the agent's session (screen lockers, power
+# managers, keyring and polkit agents, updaters and tray nags are dialog sources).
+[Desktop Entry]
+Type=Application
+Name=polkit-gnome-authentication-agent-1
+Hidden=true

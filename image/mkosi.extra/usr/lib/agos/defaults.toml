@@ -1,0 +1,30 @@
+# agos image defaults (layer 1 of the configuration contract, docs/spec.md).
+# Do not edit: put overrides in /etc/agos/config.toml (cloud-init write_files),
+# an AGOS-labelled FAT filesystem, or the systemd credential agos.config.
+# Precedence: defaults < AGOS filesystem < /etc/agos < credentials.
+
+hostname = ""                    # optional; a hostname set by cloud-init wins
+
+[display]
+width = 1280
+height = 800
+
+[viewer]                         # KasmVNC web client
+listen = "127.0.0.1"             # "0.0.0.0" = LAN mode
+port = 8444
+tls = "auto"                     # auto: off on loopback, self-signed on LAN; "on" | "off"
+user = "agos"                    # basic-auth user; password from VIEWER_PASSWORD
+
+[agentd]
+listen = "127.0.0.1:8765"
+# Other keys in this table are passed through to ~/.config/agentd/config.toml.
+
+[tailscale]
+enabled = "auto"                 # auto = on iff TS_AUTHKEY is set (or already joined)
+hostname = ""                    # default: system hostname
+tags = ["tag:agos"]
+serve = true                     # https://<host>.<tailnet>.ts.net -> viewer, :8765 -> agentd
+ssh = false                      # Tailscale SSH
+
+[agents]
+claude_code = true

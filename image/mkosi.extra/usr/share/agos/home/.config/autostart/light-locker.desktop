@@ -1,0 +1,6 @@
+# agos: never autostart light-locker in the agent's session (screen lockers, power
+# managers, keyring and polkit agents, updaters and tray nags are dialog sources).
+[Desktop Entry]
+Type=Application
+Name=light-locker
+Hidden=true

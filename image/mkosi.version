@@ -1,0 +1,3 @@
+#!/bin/sh
+# ImageVersion= comes from the repository's single VERSION file.
+exec cat ../VERSION

@@ -1,0 +1,6 @@
+# agos: flags for every Chromium launch (sourced by /usr/bin/chromium), not just
+# agos-browser.
+# --password-store=basic prevents "Unlock keyring" dialogs (no keyring daemon);
+# --no-first-run/--no-default-browser-check prevent first-run bubbles;
+# --disable-search-engine-choice-screen prevents the search engine chooser.
+export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --password-store=basic --no-first-run --no-default-browser-check --disable-search-engine-choice-screen"

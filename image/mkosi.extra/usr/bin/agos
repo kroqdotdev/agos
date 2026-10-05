@@ -1,0 +1,125 @@
+#!/usr/bin/python3
+"""agos: admin CLI for the agos guest image.
+
+  agos status [--json]     state.json plus live checks of the desktop stack
+  agos apply               re-run agos-firstboot and restart the desktop (root)
+  agos viewer view|control|status
+                           switch the KasmVNC viewer's input permission
+  agos version
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import importlib.machinery
+import importlib.util
+from pathlib import Path
+
+FIRSTBOOT = "/usr/lib/agos/agos-firstboot"
+STATE = Path("/var/lib/agos/state.json")
+
+
+def firstboot_module():
+    # agos-firstboot has no .py suffix, so load it with an explicit loader
+    loader = importlib.machinery.SourceFileLoader("agos_firstboot", FIRSTBOOT)
+    spec = importlib.util.spec_from_loader("agos_firstboot", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+def system_units() -> dict:
+    out = {}
+    for unit in ("agos-firstboot.service", "agos-ready.service", "ssh.service", "tailscaled.service",
+                 "cloud-init-network.service", "qemu-guest-agent.service"):
+        res = subprocess.run(["systemctl", "is-active", unit], capture_output=True, text=True)
+        out[unit] = res.stdout.strip() or "unknown"
+    return out
+
+
+def cmd_status(args) -> int:
+    try:
+        state = json.loads(STATE.read_text())
+    except (OSError, ValueError):
+        state = {"state": "unknown", "errors": [f"{STATE} missing (first boot not finished?)"]}
+    live = {}
+    if os.geteuid() == 0:
+        fb = firstboot_module()
+        live = fb.checks(state)
+    elif os.getuid() == 1000:
+        for unit in ("agos-display.service", "agos-session.service", "agentd.service"):
+            res = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit])
+            live[unit] = res.returncode == 0
+    report = dict(state, live=live, units=system_units())
+    if args.json:
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if state.get("state") == "ready" else 1
+    v, ts, ag = state.get("viewer", {}), state.get("tailscale", {}), state.get("agentd", {})
+    print(f"agos {state.get('version', '?')} ({state.get('arch', '?')})  state: {state.get('state')}")
+    print(f"  hostname   {state.get('hostname', '?')}   ipv4 {' '.join(state.get('ipv4', [])) or '-'}")
+    print(f"  display    {state.get('display', {}).get('width')}x{state.get('display', {}).get('height')}")
+    print(f"  viewer     {v.get('url', '?')}  auth={'yes (user ' + v.get('user', '') + ')' if v.get('auth') else 'no'}"
+          f"  tls={'yes' if v.get('tls') else 'no'}")
+    print(f"  agentd     {ag.get('listen', '?')}  installed={'yes' if ag.get('installed') else 'no'}")
+    if ts.get("enabled"):
+        print(f"  tailscale  {ts.get('state')}  {ts.get('dns_name', '')}  {' '.join(ts.get('urls', []))}")
+    else:
+        print("  tailscale  disabled")
+    if state.get("ready_uptime"):
+        print(f"  ready      {state['ready_uptime']}s after boot")
+    for name, ok in live.items():
+        print(f"  check      {name}: {'ok' if ok else 'FAILED'}")
+    for name, st in report["units"].items():
+        print(f"  unit       {name}: {st}")
+    for err in state.get("errors", []):
+        print(f"  error      {err}")
+    for warn in state.get("warnings", []):
+        print(f"  warning    {warn}")
+    return 0 if state.get("state") == "ready" else 1
+
+
+def cmd_apply(args) -> int:
+    if os.geteuid() != 0:
+        print("agos apply: run as root (sudo agos apply)", file=sys.stderr)
+        return 1
+    rc = subprocess.run(["systemctl", "restart", "agos-firstboot.service"]).returncode
+    fb = firstboot_module()
+    prefix, env = fb.agent_env()
+    subprocess.run(prefix + ["systemctl", "--user", "restart", "agos-display.service", "agentd.service"],
+                   env=env)
+    subprocess.run(["systemctl", "restart", "agos-ready.service"])
+    return rc
+
+
+def cmd_viewer(args) -> int:
+    return subprocess.run(["/usr/lib/agos/viewer-perm", args.mode]).returncode
+
+
+def cmd_version(args) -> int:
+    try:
+        info = json.loads(Path("/usr/lib/agos/build-info.json").read_text())
+    except (OSError, ValueError):
+        info = {}
+    print(f"agos {info.get('version', '?')} {info.get('arch', '')} built {info.get('built', '?')}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="agos", description="agos guest image admin CLI")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    p = sub.add_parser("status", help="show state and live checks")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_status)
+    sub.add_parser("apply", help="re-apply /etc/agos config now").set_defaults(func=cmd_apply)
+    p = sub.add_parser("viewer", help="switch the viewer between view-only and control")
+    p.add_argument("mode", choices=["view", "control", "status"])
+    p.set_defaults(func=cmd_viewer)
+    sub.add_parser("version").set_defaults(func=cmd_version)
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,10 @@
+# cloud-init network-config (version 2): DHCP on the first wired NIC.
+# This is also what happens with no network-config at all; keep it as a
+# starting point, or use network-config.static for a fixed address.
+version: 2
+ethernets:
+  primary:
+    match:
+      name: "e*"
+    dhcp4: true
+    dhcp6: true

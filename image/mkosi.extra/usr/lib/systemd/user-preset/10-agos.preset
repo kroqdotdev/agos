@@ -1,0 +1,6 @@
+# agos: the agent's desktop stack, wanted by the user manager's default.target.
+enable agos-display.service
+enable agos-session.service
+enable agentd.service
+# KasmVNC's own vncserver wrapper unit is not used
+disable kasmvncserver@.service

@@ -1,0 +1,15 @@
+// agos: unattended security updates, never a reboot in the middle of a task.
+// Debian-Security is already allowed by 50unattended-upgrades; add the vendor
+// repos that ship the remote-access path and the agent CLI.
+Unattended-Upgrade::Origins-Pattern {
+        "origin=Tailscale,codename=${distro_codename}";
+        "origin=Anthropic,label=Anthropic";
+};
+// prevents surprise reboots mid-task; kernels take effect at the next reboot
+Unattended-Upgrade::Automatic-Reboot "false";
+// prevents conffile prompts from blocking an upgrade
+Dpkg::Options { "--force-confdef"; "--force-confold"; };
+Unattended-Upgrade::AutoFixInterruptedDpkg "true";
+Unattended-Upgrade::MinimalSteps "true";
+Unattended-Upgrade::Remove-Unused-Kernel-Packages "true";
+Unattended-Upgrade::OnlyOnACPower "false";

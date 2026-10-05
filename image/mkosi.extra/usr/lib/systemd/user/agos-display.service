@@ -1,0 +1,22 @@
+# agos display: KasmVNC's Xvnc on :1 is both the agent's X server and the
+# human's web viewer. Settings come from ~/.config/agos/display.env, rendered
+# by agos-firstboot from /etc/agos/config.toml.
+[Unit]
+Description=agos display (KasmVNC Xvnc :1)
+Documentation=file:///usr/share/doc/agos/README.md
+ConditionUser=agent
+# Keep the XFCE session running whenever the display is up, including after
+# Xvnc restarts (the session is bound to the display and stops with it).
+Upholds=agos-session.service
+# prevents systemd from giving up after a few quick crashes
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/lib/agos/agos-display
+Restart=always
+RestartSec=2
+# Xvnc logs to stdout -> journal (journalctl --user -u agos-display)
+
+[Install]
+WantedBy=default.target

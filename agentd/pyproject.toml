@@ -1,0 +1,40 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agentd"
+version = "0.1.0"
+description = "agos computer-use control daemon: screenshots, input, REST/MCP transports, takeover lease"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "mcp>=2.3,<3",
+    "mss>=10,<11",
+    "pillow>=10,<13",
+    "python-xlib>=0.33,<1",
+    "starlette>=0.48,<2",
+    "uvicorn>=0.31,<1",
+]
+
+[project.scripts]
+agentd = "agentd.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8,<10"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agentd"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+filterwarnings = ["ignore::DeprecationWarning:Xlib.*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "SIM", "RUF"]
+ignore = ["RUF059"]

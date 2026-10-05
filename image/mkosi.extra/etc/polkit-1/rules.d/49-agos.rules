@@ -1,0 +1,8 @@
+// agos: "agent" already has passwordless sudo, so let it pass every polkit
+// check. Prevents "Authentication is required ..." dialogs in the desktop,
+// e.g. colord's "create a color managed device" popup in VNC sessions.
+polkit.addRule(function (action, subject) {
+    if (subject.user == "agent") {
+        return polkit.Result.YES;
+    }
+});

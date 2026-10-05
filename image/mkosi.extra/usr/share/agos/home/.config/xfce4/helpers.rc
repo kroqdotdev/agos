@@ -1,0 +1,4 @@
+# prevents exo's "Choose your preferred web browser/terminal/file manager" dialog
+WebBrowser=agos-browser
+TerminalEmulator=xfce4-terminal
+FileManager=thunar

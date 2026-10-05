@@ -1,0 +1,8 @@
+#!/usr/bin/env bash
+# Fake `qemu-img info --output=json`: FAKE_IMG_VSIZE bytes (default 8 GiB).
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=../lib.sh
+. "$(dirname "$0")/../lib.sh"
+record qemu-img "$@"
+[[ ${1:-} == info ]] || exit 1
+printf '{"virtual-size": %s, "format": "qcow2"}\n' "${FAKE_IMG_VSIZE:-8589934592}"

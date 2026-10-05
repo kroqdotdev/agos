@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Run KasmVNC's Xvnc on :1 for the agent (systemd user unit agos-display).
+# This replaces KasmVNC's interactive "vncserver" wrapper: every file it would
+# prompt for (users, xstartup, DE choice) is either rendered by agos-firstboot
+# or not needed, and the arguments below mirror what the wrapper derives from
+# kasmvnc.yaml.
+set -euo pipefail
+
+num=1
+envfile="$HOME/.config/agos/display.env"
+
+# Defaults until agos-firstboot has rendered display.env: loopback, no auth.
+WIDTH=1280 HEIGHT=800 DEPTH=24 LISTEN=127.0.0.1 PORT=8444 SSL_ONLY=0 BASIC_AUTH=0 FRAME_RATE=30
+CERT="$HOME/.config/agos/tls/viewer.crt" KEY="$HOME/.config/agos/tls/viewer.key"
+if [[ -r "$envfile" ]]; then
+  while IFS='=' read -r k v; do
+    case "$k" in
+      WIDTH|HEIGHT|DEPTH|LISTEN|PORT|SSL_ONLY|BASIC_AUTH|FRAME_RATE|CERT|KEY) printf -v "$k" '%s' "$v" ;;
+    esac
+  done < <(grep -E '^[A-Z_]+=' "$envfile")
+fi
+
+umask 077
+mkdir -p "$HOME/.vnc"
+# KasmVNC authenticates viewers with HTTP basic auth (~/.kasmpasswd). Like the
+# vncserver wrapper, give the legacy VNC password check a fixed dummy file; no
+# RFB port is opened in websocket mode, so it is never reachable.
+if [[ ! -s "$HOME/.vnc/passwd" ]]; then
+  echo 'WrLNwLrcrxM=' | base64 -d > "$HOME/.vnc/passwd"
+fi
+[[ -e "$HOME/.kasmpasswd" ]] || : > "$HOME/.kasmpasswd"
+
+# Fresh X cookie per server start, stored twice: as FamilyLocal for this
+# hostname (python-xlib, used by agentd, only matches that) and as FamilyWild
+# ("ffff") so libX11 clients still match after a hostname change.
+xauthority="$HOME/.Xauthority"
+cookie="$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+touch "$xauthority"
+xauth -q -f "$xauthority" remove ":$num" 2>/dev/null || true
+xauth -q -f "$xauthority" add "$(uname -n)/unix:$num" . "$cookie"
+printf 'ffff 0000  0001 %s 0012 4d49542d4d414749432d434f4f4b49452d31 0010 %s\n' \
+  "$(printf '%s' "$num" | od -An -tx1 | tr -d ' \n')" "$cookie" | xauth -q -f "$xauthority" nmerge -
+
+args=(
+  ":$num"
+  -geometry "${WIDTH}x${HEIGHT}" -depth "$DEPTH"
+  # pins the agent's resolution: browser viewers cannot resize the desktop
+  -AcceptSetDesktopSize 0
+  -interface "$LISTEN" -websocketPort "$PORT"
+  -httpd /usr/share/kasmvnc/www
+  -sslOnly "$SSL_ONLY" -cert "$CERT" -key "$KEY"
+  -KasmPasswordFile "$HOME/.kasmpasswd"
+  -rfbauth "$HOME/.vnc/passwd"
+  -auth "$xauthority" -nolisten tcp
+  -fp "/usr/share/fonts/X11/misc,built-ins"
+  -desktop agos
+  # prevents the server-side "accept this connection?" prompt
+  -QueryConnect 0
+  # viewers are never timed out or kicked by a newer viewer
+  -MaxConnectionTime 0 -MaxDisconnectionTime 0 -MaxIdleTime 0 -IdleTimeout 0
+  -DisconnectClients 0
+  -FrameRate "$FRAME_RATE"
+  # no STUN lookups of the public IP
+  -PublicIP 127.0.0.1
+  # brute-force protection for basic auth
+  -BlacklistThreshold 5 -BlacklistTimeout 10
+  # the web client's WASM decoder needs cross-origin isolation
+  -http-header Cross-Origin-Embedder-Policy=require-corp
+  -http-header Cross-Origin-Opener-Policy=same-origin
+  -Log '*:stdout:30'
+)
+if [[ "$BASIC_AUTH" != 1 ]]; then
+  # loopback-only viewer without a password (spec default)
+  args+=(-disableBasicAuth)
+fi
+if [[ -r /dev/dri/renderD128 && -w /dev/dri/renderD128 ]]; then
+  args+=(-drinode /dev/dri/renderD128)
+fi
+
+exec /usr/bin/Xvnc "${args[@]}"

@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+# Fake `qm` (QEMU/KVM manager) for the agos-proxmox.sh tests.
+#
+# Guest behaviour knobs:
+#   FAKE_AGENT_AFTER   pings before the guest agent answers (default 1)
+#   FAKE_READY_AFTER   state.json reads before it says ready (default 1)
+#   FAKE_NEVER_READY=1 state.json never appears
+#   FAKE_GUEST_STATE   state reported once "ready" would be (default ready)
+#   FAKE_TAILSCALE=1   `tailscale status --json` reports a tailnet name
+#   FAKE_LAN=1         /run/agos/config.json says viewer.listen = 0.0.0.0
+#   FAKE_DIE_AFTER_START=1  the VM stops right after it starts
+set -euo pipefail
+# shellcheck source-path=SCRIPTDIR source=../lib.sh
+. "$(dirname "$0")/../lib.sh"
+record qm "$@"
+maybe_fail qm "$@"
+
+json_out() {
+	# exitcode out-data -> qm guest exec style JSON
+	perl -MJSON::PP -e 'print JSON::PP->new->canonical->pretty->encode({exitcode => 0 + $ARGV[0], exited => 1, "out-data" => $ARGV[1]})' "$1" "$2"
+}
+
+apply_opts() {
+	local vmid=$1 key val store rest path
+	shift
+	while (($#)); do
+		key=${1#--}
+		val=${2-}
+		shift 2 || {
+			echo "qm: option --$key needs a value" >&2
+			exit 255
+		}
+		case $key in
+		delete)
+			conf_del "$vmid" "$val"
+			continue
+			;;
+		efidisk0)
+			store=${val%%:*}
+			val="$store:vm-$vmid-disk-0,${val#*,}"
+			;;
+		scsi0 | virtio0 | sata0)
+			if [[ $val == *import-from=* ]]; then
+				path=${val#*import-from=}
+				path=${path%%,*}
+				[[ -f $path ]] || {
+					echo "qm: import source '$path' does not exist" >&2
+					exit 255
+				}
+				store=${val%%:*}
+				rest=${val#*,}
+				rest=${rest/import-from=$path,/}
+				rest=${rest/import-from=$path/}
+				val="$store:vm-$vmid-disk-1,${rest}"
+			fi
+			;;
+		ide2 | scsi1)
+			if [[ $val == *media=cdrom* && ${val%%,*} != none ]]; then
+				path=$(storage_path "${val%%,*}") || exit 255
+				[[ -f $path ]] || {
+					echo "qm: volume '${val%%,*}' does not exist" >&2
+					exit 255
+				}
+				mkdir -p "$FAKE_STATE/artifacts"
+				cp "$path" "$FAKE_STATE/artifacts/$vmid-seed.iso"
+			fi
+			;;
+		esac
+		conf_set "$vmid" "$key" "$val"
+	done
+}
+
+sub=${1:-}
+shift || true
+case $sub in
+create)
+	vmid=$1
+	shift
+	if [[ -f $(conf "$vmid") ]]; then
+		echo "unable to create VM $vmid - VM $vmid already exists" >&2
+		exit 255
+	fi
+	: >"$(conf "$vmid")"
+	echo stopped >"$QDIR/$vmid.status"
+	apply_opts "$vmid" "$@"
+	;;
+set)
+	vmid=$1
+	shift
+	need_local_vm "$vmid"
+	apply_opts "$vmid" "$@"
+	;;
+config)
+	need_local_vm "$1"
+	cat "$(conf "$1")"
+	;;
+status)
+	need_local_vm "$1"
+	printf 'status: %s\n' "$(cat "$QDIR/$1.status")"
+	;;
+start)
+	need_local_vm "$1"
+	if [[ ${FAKE_DIE_AFTER_START:-0} == 1 ]]; then
+		echo stopped >"$QDIR/$1.status"
+	else
+		echo running >"$QDIR/$1.status"
+	fi
+	rm -f "$QDIR/$1.pings" "$QDIR/$1.reads"
+	;;
+stop | shutdown)
+	need_local_vm "$1"
+	echo stopped >"$QDIR/$1.status"
+	;;
+destroy)
+	need_local_vm "$1"
+	rm -f "$QDIR/$1".*
+	rm -f "/etc/pve/firewall/$1.fw"
+	;;
+resize)
+	need_local_vm "$1"
+	;;
+disk)
+	op=$1
+	shift
+	case $op in
+	import)
+		need_local_vm "$1"
+		conf_set "$1" unused0 "$3:vm-$1-disk-9"
+		;;
+	resize) need_local_vm "$1" ;;
+	*)
+		echo "fake qm: unsupported 'disk $op'" >&2
+		exit 255
+		;;
+	esac
+	;;
+importdisk)
+	need_local_vm "$1"
+	conf_set "$1" unused0 "$3:vm-$1-disk-9"
+	;;
+snapshot)
+	need_local_vm "$1"
+	printf '%s\n' "$2" >>"$QDIR/$1.snapshots"
+	;;
+listsnapshot)
+	need_local_vm "$1"
+	if [[ -f $QDIR/$1.snapshots ]]; then
+		while read -r s; do printf '`-> %-20s 2026-10-05 10:00:00     agos\n' "$s"; done <"$QDIR/$1.snapshots"
+	fi
+	printf ' `-> current                                        You are here!\n'
+	;;
+rollback)
+	need_local_vm "$1"
+	grep -qx "$2" "$QDIR/$1.snapshots" 2>/dev/null || {
+		echo "snapshot '$2' does not exist" >&2
+		exit 255
+	}
+	echo stopped >"$QDIR/$1.status"
+	;;
+list)
+	printf '      VMID NAME                 STATUS     MEM(MB)    BOOTDISK(GB) PID\n'
+	for f in "$QDIR"/*.conf; do
+		[[ -e $f ]] || continue
+		id=$(basename "$f" .conf)
+		[[ $(vm_node "$id") == "$FAKE_NODE" ]] || continue
+		printf '%10s %-20s %-10s %-10s %-12s %s\n' "$id" "$(conf_get "$id" name)" "$(cat "$QDIR/$id.status")" 8192 64.00 0
+	done
+	;;
+agent | guest)
+	if [[ $sub == guest ]]; then
+		gsub=$1
+		shift
+	else
+		gsub=cmd
+	fi
+	vmid=$1
+	shift
+	need_local_vm "$vmid"
+	if [[ $(cat "$QDIR/$vmid.status") != running ]]; then
+		echo "VM $vmid is not running" >&2
+		exit 255
+	fi
+	if [[ $gsub == cmd ]]; then
+		case $1 in
+		ping)
+			n=$(counter "$vmid" pings)
+			if ((n < ${FAKE_AGENT_AFTER:-1})); then
+				echo "QEMU guest agent is not running" >&2
+				exit 255
+			fi
+			;;
+		network-get-interfaces)
+			cat "$(dirname "$0")/../../fixtures/network-get-interfaces.json"
+			;;
+		*)
+			echo "fake qm: unsupported guest cmd $1" >&2
+			exit 255
+			;;
+		esac
+		exit 0
+	fi
+	[[ $gsub == exec ]] || {
+		echo "fake qm: unsupported guest $gsub" >&2
+		exit 255
+	}
+	while [[ ${1:-} == --* && $1 != -- ]]; do shift 2; done
+	[[ ${1:-} == -- ]] && shift
+	case "$*" in
+	"cat /var/lib/agos/state.json")
+		n=$(counter "$vmid" reads)
+		if [[ ${FAKE_NEVER_READY:-0} == 1 ]] || ((n < ${FAKE_READY_AFTER:-1})); then
+			perl -MJSON::PP -e 'print encode_json({exitcode => 1, exited => 1, "err-data" => "cat: /var/lib/agos/state.json: No such file or directory\n"})'
+		else
+			json_out 0 "{\"state\": \"${FAKE_GUEST_STATE:-ready}\", \"version\": \"0.1.0\", \"message\": \"fake guest\"}"
+		fi
+		;;
+	"cat /run/agos/config.json")
+		listen=127.0.0.1
+		[[ ${FAKE_LAN:-0} == 1 ]] && listen=0.0.0.0
+		json_out 0 "{\"viewer\":{\"listen\":\"$listen\",\"port\":8444,\"tls\":\"auto\",\"user\":\"agos\"},\"agentd\":{\"listen\":\"127.0.0.1:8765\"},\"tailscale\":{\"enabled\":true,\"serve\":true}}"
+		;;
+	"tailscale status --json")
+		if [[ ${FAKE_TAILSCALE:-0} == 1 ]]; then
+			json_out 0 '{"BackendState":"Running","Self":{"DNSName":"agos.tail1234.ts.net.","TailscaleIPs":["100.101.102.103"]}}'
+		else
+			json_out 1 ""
+		fi
+		;;
+	*)
+		json_out 127 ""
+		;;
+	esac
+	;;
+*)
+	echo "fake qm: unsupported subcommand '$sub'" >&2
+	exit 255
+	;;
+esac

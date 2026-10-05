@@ -1,0 +1,82 @@
+#cloud-config
+# agos example seed (cloud-init NoCloud user-data).
+#
+# Copy this directory, edit the copy, then build a seed ISO with
+#   ./make-seed.sh -o seed.iso
+# and attach it to the VM as a CD-ROM for its first boot. The keys under
+# write_files are the contract in docs/spec.md ("Configuration contract").
+#
+# Once you put real secrets in here, treat this file and the seed ISO like a
+# password: keep them private and delete the ISO after first boot.
+
+# Wins over config.toml's `hostname`. Also the default Tailscale hostname.
+hostname: agos
+
+# The image already has user `agent` (uid 1000, passwordless sudo, password
+# locked). Listing it here only adds SSH keys; it does not recreate the user.
+users:
+  - name: agent
+    lock_passwd: true
+    ssh_authorized_keys:
+      # REPLACE with your own public key(s). make-seed.sh refuses to build
+      # while this placeholder is still here.
+      - "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIREPLACE_WITH_YOUR_PUBLIC_KEY you@laptop"
+
+ssh_pwauth: false        # keys only (spec: no passwords over SSH)
+disable_root: true
+
+write_files:
+  # Non-secret settings. Every key is optional; the values below are the image
+  # defaults, so delete whatever you do not change.
+  - path: /etc/agos/config.toml
+    owner: root:root
+    permissions: "0644"
+    content: |
+      hostname = "agos"                # optional; cloud-init `hostname` above wins
+
+      [display]
+      width = 1280                     # the agent's screen, pinned (viewers cannot resize it)
+      height = 800
+
+      [viewer]                         # KasmVNC web client
+      listen = "127.0.0.1"             # "0.0.0.0" = LAN mode: https://<vm-ip>:8444
+      port = 8444
+      tls = "auto"                     # auto: off on loopback, self-signed in LAN mode
+      user = "agos"                    # basic-auth user; password is VIEWER_PASSWORD
+                                       # (generated at first boot if unset in LAN mode)
+
+      [agentd]
+      listen = "127.0.0.1:8765"        # REST /v1, MCP /mcp, UI /ui; always needs a Bearer token
+
+      [tailscale]
+      enabled = "auto"                 # auto = on iff TS_AUTHKEY is set below
+      hostname = ""                    # default: the system hostname
+      tags = ["tag:agos"]              # must match the tags your OAuth client may assign
+      serve = true                     # https://<host>.<tailnet>.ts.net      -> desktop
+                                       # https://<host>.<tailnet>.ts.net:8765 -> agentd
+      ssh = false                      # Tailscale SSH
+
+      [agents]
+      claude_code = true               # Claude Code preinstalled for `agent`
+
+  # Secrets. KEY=value lines; uncomment and fill in what you use. Leave a line
+  # commented out rather than empty.
+  - path: /etc/agos/secrets.env
+    owner: root:root
+    permissions: "0600"
+    content: |
+      # Tailscale: an OAuth client secret with the auth_keys scope and tag:agos
+      # (does not expire), or a plain auth key (expires after at most 90 days).
+      # TS_AUTHKEY=tskey-client-XXXXXXXXXXXX-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+      # KasmVNC basic-auth password for user `agos` (generated if unset in LAN mode).
+      # VIEWER_PASSWORD=change-me
+
+      # Admin bearer token for agentd's TCP API (generated if unset).
+      # AGENTD_TOKEN=
+
+      # Exported into the agent user's environment. Prefer a per-VM key with
+      # its own spend limit: assume anything inside the VM can leak.
+      # ANTHROPIC_API_KEY=sk-ant-...
+      # CLAUDE_CODE_OAUTH_TOKEN=
+      # OPENAI_API_KEY=sk-...

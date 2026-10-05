@@ -33,7 +33,7 @@ jobs:
     env:
       ARCH: ${{ matrix.arch }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Free disk space (the build needs ~20 GB)
         run: |
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache
@@ -48,7 +48,7 @@ jobs:
           rm -f image/mkosi.output/SHA256SUMS
       - name: Boot test (no keyboard, no human)
         run: make -C image boot-test ARCH="$ARCH"
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: agos-${{ matrix.arch }}
           path: |
@@ -57,11 +57,16 @@ jobs:
             image/mkosi.output/agos-*-${{ matrix.arch }}.manifest
           retention-days: 7
           compression-level: 0
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: always()
         with:
           name: boot-test-${{ matrix.arch }}
-          path: out/
+          # Not the whole out/ dir: it also holds the test VM's SSH key and seed.
+          path: |
+            out/*.png
+            out/boot-test-*/results.json
+            out/boot-test-*/serial.log
+            out/boot-test-*/qemu.log
           retention-days: 7
 
   release:
@@ -71,12 +76,12 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Tag must match VERSION
         run: |
           want="v$(cat VERSION)"
           [ "$GITHUB_REF_NAME" = "$want" ] || { echo "tag $GITHUB_REF_NAME != $want"; exit 1; }
-      - uses: actions/download-artifact@v5
+      - uses: actions/download-artifact@v8
         with:
           pattern: agos-*
           path: dist
@@ -104,7 +109,7 @@ jobs:
           printf '%s\n' "$MINISIGN_PASSWORD" |
             minisign -S -s "$RUNNER_TEMP/minisign.key" -m dist/SHA256SUMS -x dist/SHA256SUMS.minisig
           rm -f "$RUNNER_TEMP/minisign.key"
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/agos-*
       - name: Publish release

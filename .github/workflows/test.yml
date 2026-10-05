@@ -15,17 +15,17 @@ jobs:
       run:
         working-directory: agentd
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Install X test tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb xdotool xclip x11-xserver-utils x11-utils
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v10
       - run: uv run --frozen pytest
       - run: uvx ruff check src tests && uvx ruff format --check src tests
 
   deploy:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - run: bash deploy/proxmox/tests/run.sh

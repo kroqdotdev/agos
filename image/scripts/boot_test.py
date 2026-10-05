@@ -312,6 +312,17 @@ def windows(vm: VM) -> list[str]:
     return vm.ssh("DISPLAY=:1 wmctrl -l -x", check=False).stdout.strip().splitlines()
 
 
+def wait_windows(vm: VM, match: str, timeout: float) -> list[str]:
+    """Poll until a window whose wmctrl line contains `match` appears (browsers
+    start in seconds under KVM but can take minutes under TCG emulation)."""
+    deadline = time.monotonic() + timeout
+    while True:
+        wins = windows(vm)
+        if any(match in w.lower() for w in wins) or time.monotonic() > deadline:
+            return wins
+        time.sleep(2)
+
+
 def check(results: dict, name: str, ok: bool, detail="") -> None:
     results.setdefault("checks", {})[name] = {"ok": bool(ok), "detail": detail}
     log(f"{'PASS' if ok else 'FAIL'} {name} {detail if isinstance(detail, str) else json.dumps(detail)}"[:300])
@@ -328,8 +339,9 @@ def main() -> int:
     out = REPO / "out"
     work = out / f"boot-test-{args.arch}"
     vm = VM(args.arch, work, args.timeout)
-    timeout = args.timeout or (600 if vm.kvm and (args.arch == "amd64" or os.uname().machine == "aarch64")
-                               else 3600)
+    accelerated = vm.kvm and (args.arch == "amd64" or os.uname().machine == "aarch64")
+    timeout = args.timeout or (600 if accelerated else 3600)
+    app_timeout = 60 if accelerated else 300
     results: dict = {"arch": args.arch, "version": VERSION, "kvm": vm.kvm,
                      "started": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     rc = 1
@@ -460,7 +472,8 @@ def main() -> int:
 
         # agos-browser: Chromium without first-run/keyring/restore dialogs
         vm.ssh("systemd-run --user --unit=agos-browser-test --collect agos-browser https://example.com/", check=False)
-        time.sleep(15)
+        wait_windows(vm, "chromium", app_timeout)
+        time.sleep(5)  # let the first page and any dialog render
         screenshot(vm, "chromium", out, results)
         wins = windows(vm)
         results["windows_chromium"] = wins
@@ -472,12 +485,16 @@ def main() -> int:
 
         # Firefox ESR policies (no Terms of Use / onboarding / default-browser prompt)
         vm.ssh("systemd-run --user --unit=agos-firefox-test --collect firefox-esr", check=False)
-        time.sleep(15)
+        wait_windows(vm, "firefox", app_timeout)
+        time.sleep(5)
         screenshot(vm, "firefox", out, results)
         results["windows_firefox"] = windows(vm)
         ff = [w for w in results["windows_firefox"] if "firefox" in w.lower()]
-        check(results, "firefox_no_first_run", len(ff) == 1 and "Welcome" not in ff[0]
-              and "Privacy" not in ff[0] and "Restore" not in ff[0], ff)
+        ff_ok = len(ff) == 1 and "Welcome" not in ff[0] and "Privacy" not in ff[0] and "Restore" not in ff[0]
+        if not ff_ok:
+            results["firefox_journal"] = vm.ssh(
+                "journalctl --user -u agos-firefox-test --no-pager -n 80", check=False).stdout[-6000:]
+        check(results, "firefox_no_first_run", ff_ok, ff)
         vm.ssh("systemctl --user stop agos-firefox-test", check=False)
 
         # Claude Code pre-seed

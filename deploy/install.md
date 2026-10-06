@@ -94,8 +94,8 @@ Propose these values and ask me to confirm or change them:
   space from step 1
 - bridge (`--bridge`, default `vmbr0`)
 - size: `--cores 4 --memory 8192 --disk 64G` unless I want more
-- my SSH public key file for user `agent` (`--ssh-key-file`, for example
-  `/root/.ssh/id_ed25519.pub`); optional
+- my SSH public key file for user `agent` (`--ssh-key-file`, usually
+  `/root/.ssh/authorized_keys`, the keys I log in to this host with); optional
 
 Then ask me to create `/root/agos.secrets` myself, in my own shell, owned by
 root with mode 0600, containing only the lines I need:
@@ -148,7 +148,7 @@ bash /root/agos-proxmox.sh --help
 With the values from step 2 (leave out flags I did not set):
 
 ```bash
-bash /root/agos-proxmox.sh --dry-run --json --name agos --storage local-lvm --bridge vmbr0 --cores 4 --memory 8192 --disk 64G --ssh-key-file /root/.ssh/id_ed25519.pub
+bash /root/agos-proxmox.sh --dry-run --json --name agos --storage local-lvm --bridge vmbr0 --cores 4 --memory 8192 --disk 64G --ssh-key-file /root/.ssh/authorized_keys
 ```
 
 It prints one JSON object and changes nothing. If it reports `"existing":true`,
@@ -166,7 +166,7 @@ Wait. Proceed only on exactly "yes".
 Same flags, without `--dry-run`, with `--yes`:
 
 ```bash
-bash /root/agos-proxmox.sh --yes --json --name agos --storage local-lvm --bridge vmbr0 --cores 4 --memory 8192 --disk 64G --ssh-key-file /root/.ssh/id_ed25519.pub
+bash /root/agos-proxmox.sh --yes --json --name agos --storage local-lvm --bridge vmbr0 --cores 4 --memory 8192 --disk 64G --ssh-key-file /root/.ssh/authorized_keys
 ```
 
 This downloads the image (a few GB), verifies it, creates and boots the VM and

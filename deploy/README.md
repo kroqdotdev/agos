@@ -113,8 +113,8 @@ curl -fsSL --proto '=https' --tlsv1.2 -o agos-SHA256SUMS.minisig "$BASE/SHA256SU
 minisign -Vm agos-SHA256SUMS -x agos-SHA256SUMS.minisig -P RWQeJEg8BJM+C3FntUGlSkbqk9PU0z3FPLJS3z4fsjfXedsmchg2OFu1   # apt install minisign
 sha256sum --ignore-missing -c agos-SHA256SUMS          # must print "agos-proxmox.sh: OK"
 less agos-proxmox.sh
-bash agos-proxmox.sh --dry-run --ssh-key-file ~/.ssh/id_ed25519.pub
-bash agos-proxmox.sh --yes     --ssh-key-file ~/.ssh/id_ed25519.pub
+bash agos-proxmox.sh --dry-run --ssh-key-file /root/.ssh/authorized_keys
+bash agos-proxmox.sh --yes     --ssh-key-file /root/.ssh/authorized_keys
 ```
 
 Release signing key (minisign, key id `0B3E93043C48241E`):

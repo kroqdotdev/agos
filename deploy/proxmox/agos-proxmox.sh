@@ -81,7 +81,7 @@ verification failed, 4 VM operation failed, 5 timed out waiting for first boot.
 Secrets are read only from --secrets-file, never from the command line, and are
 never printed. Examples:
   agos-proxmox.sh --dry-run                 # plan only
-  agos-proxmox.sh --yes --ssh-key-file ~/.ssh/id_ed25519.pub
+  agos-proxmox.sh --yes --ssh-key-file /root/.ssh/authorized_keys   # the keys you log in to this host with
   agos-proxmox.sh status --json
   agos-proxmox.sh reset --name agos --yes
 EOF
@@ -678,7 +678,8 @@ check_config_file() {
 check_ssh_keys() {
 	SSH_KEYS=()
 	[[ -n $SSH_KEY_FILE ]] || return 0
-	[[ -f $SSH_KEY_FILE && -r $SSH_KEY_FILE ]] || die "$EX_PREFLIGHT" "SSH key file $SSH_KEY_FILE not found"
+	[[ -f $SSH_KEY_FILE && -r $SSH_KEY_FILE ]] ||
+		die "$EX_PREFLIGHT" "SSH key file $SSH_KEY_FILE not found (the keys you log in to this host with are in /root/.ssh/authorized_keys)"
 	if grep -q 'PRIVATE KEY' -- "$SSH_KEY_FILE"; then
 		die "$EX_PREFLIGHT" "$SSH_KEY_FILE is a private key; pass the .pub file"
 	fi

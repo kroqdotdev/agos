@@ -131,7 +131,10 @@ listen = "127.0.0.1:8765"
 [tailscale]
 enabled = "auto"                 # auto = on iff TS_AUTHKEY is set (or already joined)
 hostname = ""                    # default: system hostname
-tags = ["tag:agos"]
+tags = []                        # empty: untagged for tskey-auth- keys (forcing a tag
+                                 # fails unless the tailnet ACL grants it); OAuth
+                                 # client secrets (tskey-client-) need a tag and
+                                 # default to ["tag:agos"]
 serve = true                     # https://<host>.<tailnet>.ts.net -> viewer
                                  # https://<host>.<tailnet>.ts.net:8765 -> agentd
 ssh = false                      # Tailscale SSH
@@ -370,11 +373,22 @@ root. Subcommands `create` (default), `status`, `reset`, `destroy`; flags
 `--ssh-key-file`, `--secrets-file` (default `/root/agos.secrets`),
 `--config-file`, `--isolate`, plus `--iso-storage`, `--cpu`,
 `--network-config`, `--image-sha256`, `--require-signature`, `--isolate-dns`,
-`--timeout`. Every flag has an `AGOS_*` environment equivalent (e.g.
-`AGOS_YES=1`, `AGOS_STORAGE`); `AGOS_REPO` selects the release repo. Exit
-codes: 0 ok (also "already exists"), 1 usage or confirmation needed without
-a TTY, 2 preflight failed, 3 download/verify failed, 4 VM operation failed,
-5 timeout waiting for ready. `--json` prints exactly one JSON object on
+`--timeout`, `--onboot`, `--wizard`, `--no-wizard`. Every flag has an
+`AGOS_*` environment equivalent (e.g. `AGOS_YES=1`, `AGOS_STORAGE`) except
+`--wizard`; `AGOS_REPO` selects the release repo. Exit
+codes: 0 ok (also "already exists"), 1 usage, confirmation needed without
+a TTY, or the guided setup cancelled, 2 preflight failed, 3 download/verify
+failed, 4 VM operation failed, 5 timeout waiting for ready.
+
+Guided setup: `bash -c "$(curl -fsSL https://kroq.dev/tools/agos-proxmox.sh)"`
+with no arguments (or only `create`), with stdout on a terminal and a usable
+`/dev/tty`, opens whiptail dialogs (also on `--wizard`); stdin may be a pipe
+(`curl | bash`). It never opens with `--json`, `--yes`, `--dry-run`, another
+subcommand, `--no-wizard`/`AGOS_NO_WIZARD=1` or without a terminal, so the
+flag behaviour above is unchanged for agents and scripts. Its answers set the
+same variables as the flags; typed secrets go to a private temp file that
+only feeds the seed. Tailscale tags in the generated `config.toml`:
+`["tag:agos"]` for `tskey-client-` secrets, `[]` for `tskey-auth-` keys. `--json` prints exactly one JSON object on
 stdout (`vmid`, `name`, `state`, `ip`, `urls.viewer`, `urls.agentd`, ...);
 progress goes to stderr. Builds its own NoCloud seed ISO (label `CIDATA`)
 instead of a PVE cloud-init drive and attaches it as `ide2` (`scsi1` on arm64,

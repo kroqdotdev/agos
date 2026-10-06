@@ -51,7 +51,9 @@ write_files:
       [tailscale]
       enabled = "auto"                 # auto = on iff TS_AUTHKEY is set below
       hostname = ""                    # default: the system hostname
-      tags = ["tag:agos"]              # must match the tags your OAuth client may assign
+      tags = ["tag:agos"]              # OAuth client secrets: tags the client may assign
+                                       # (default ["tag:agos"]); auth keys: leave out unless
+                                       # your ACL tagOwners grants the tag
       serve = true                     # https://<host>.<tailnet>.ts.net      -> desktop
                                        # https://<host>.<tailnet>.ts.net:8765 -> agentd
       ssh = false                      # Tailscale SSH

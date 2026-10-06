@@ -219,6 +219,12 @@ agent | guest)
 		[[ ${FAKE_LAN:-0} == 1 ]] && listen=0.0.0.0
 		json_out 0 "{\"viewer\":{\"listen\":\"$listen\",\"port\":8444,\"tls\":\"auto\",\"user\":\"agos\"},\"agentd\":{\"listen\":\"127.0.0.1:8765\"},\"tailscale\":{\"enabled\":true,\"serve\":true}}"
 		;;
+	"grep -E ^(VIEWER_PASSWORD|AGENTD_TOKEN)= /etc/agos/secrets.env")
+		# what agos-firstboot generated; must only ever reach the final dialog
+		json_out 0 "VIEWER_PASSWORD=SENTINELview42
+AGENTD_TOKEN=agd_SENTINELtok42
+"
+		;;
 	"tailscale status --json")
 		if [[ ${FAKE_TAILSCALE:-0} == 1 ]]; then
 			json_out 0 '{"BackendState":"Running","Self":{"DNSName":"agos.tail1234.ts.net.","TailscaleIPs":["100.101.102.103"]}}'

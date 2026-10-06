@@ -86,18 +86,72 @@ listen = "0.0.0.0"     # desktop at https://<vm-ip>:8444 (self-signed), user ago
 Runs on the Proxmox host as root. Supports PVE 8.x and 9.x on amd64, and PVE
 9.2+ on arm64 (Grace/Vera and other UEFI Armv9 servers; not Raspberry Pi).
 
-### Quick start
+### Guided setup (one line)
 
-One-liner: it prints a short plan and asks before changing anything.
+Paste this into the Proxmox host's shell (web UI → node → Shell, or SSH) as
+root. Everything after that is pickers and inputs; nothing changes until you
+confirm the summary, and ESC quits at any point with "aborted, nothing
+changed".
 
 ```bash
-bash -c "$(curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/proxmox/agos-proxmox.sh)"
+bash -c "$(curl -fsSL https://kroq.dev/tools/agos-proxmox.sh)"
 ```
 
-Arguments go after a dummy `$0`:
+The dialogs, in order:
+
+1. Banner and preflight: root, Proxmox VE version, architecture, KVM (✓/✗).
+2. "Create a new agos VM?"
+3. **Settings**: *Default* (next free VMID, name `agos`, 4 cores, 8 GiB RAM,
+   64 GiB disk on the images storage with the most free space, bridge
+   `vmbr0`, start at boot) or *Advanced*, which asks for each of those (a menu
+   of your storages with free space, a menu of your bridges), the CPU type
+   (`host` or `x86-64-v2-AES`), start at boot and the experimental
+   [isolation](#isolation---isolate-experimental).
+4. If `/root/agos.secrets` exists: use it? Only what it lacks is asked for
+   later.
+5. **Access**: *Tailscale* (recommended; paste an OAuth client secret or auth
+   key, see the tags note below), *LAN* (desktop on `https://<vm-ip>:8444`,
+   optional password, blank = generated), or *SSH tunnel only*.
+6. **SSH keys** for user `agent`: a checklist of the keys in
+   `/root/.ssh/authorized_keys` (type, short fingerprint, comment; all ticked),
+   then an optional box to paste one more public key.
+7. Optional **agent credentials**: an Anthropic API key or Claude Code OAuth
+   token, and an OpenAI API key (blank = skip).
+8. **Summary** (the same plan text as `--dry-run`), then *Create*, *Show the
+   exact commands first*, or *Quit*.
+9. Progress in the terminal, then a final box with the desktop URL, viewer
+   user and password, agentd URL and token, the SSH command and the
+   reset/destroy commands. After it closes the terminal shows the same
+   summary without the password and token.
+
+Tailscale tags: an OAuth client secret (`tskey-client-…`) can only create
+tagged devices, so the wizard tags the VM `tag:agos` (the client must be
+allowed to assign it). A plain auth key (`tskey-auth-…`) joins untagged,
+because forcing a tag fails unless your tailnet policy's `tagOwners` lets you
+use it. *Advanced* lets you edit the tags; they go into the VM's
+`config.toml`.
+
+Secrets you type stay in memory and in one private temp file (mode 0600,
+deleted on every exit) that only feeds the VM's seed. They are never passed as
+command-line arguments, never printed to the terminal or logs, and the final
+box receives the generated password and token through an anonymous memory
+file. Long boxes that do not fit your terminal scroll: use the arrow keys,
+then Tab and Enter.
+
+The wizard opens only for a bare invocation on a terminal (`curl … | bash`
+works too, the dialogs are drawn on `/dev/tty`), or with `--wizard`. Any of
+`--yes`, `--json`, `--dry-run`, another subcommand, `--no-wizard`, or no
+terminal keeps it off and the script behaves exactly as described under
+flags below. It needs `whiptail`, which Proxmox VE ships; without it the
+script says `apt install whiptail` (or use flags).
+
+### Unattended: flags (scripts and agents)
+
+The same one-liner takes flags after a dummy `$0`; with flags there are no
+dialogs:
 
 ```bash
-bash -c "$(curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/proxmox/agos-proxmox.sh)" agos-proxmox.sh --dry-run
+bash -c "$(curl -fsSL https://kroq.dev/tools/agos-proxmox.sh)" _ --dry-run --ssh-key-file /root/.ssh/authorized_keys
 ```
 
 Download, verify, read, run (recommended, and the only form the agent runbook
@@ -186,6 +240,8 @@ with `--isolate`.
 
 | Flag | Env | Default | Meaning |
 |---|---|---|---|
+| `--wizard` | | on a bare terminal run | open the guided setup |
+| `--no-wizard` | `AGOS_NO_WIZARD=1` | | never open it |
 | `--dry-run` | `AGOS_DRY_RUN=1` | | check everything, print the plan, change nothing |
 | `--json` | `AGOS_JSON=1` | | one JSON object on stdout; progress on stderr |
 | `-y`, `--yes` | `AGOS_YES=1` | | no confirmation prompt |
@@ -198,6 +254,7 @@ with `--isolate`.
 | `--memory MiB` | `AGOS_MEMORY` | 8192 | RAM |
 | `--disk SIZE` | `AGOS_DISK` | `64G` | system disk |
 | `--cpu TYPE` | `AGOS_CPU` | `host` | `x86-64-v2-AES` if the VM must live-migrate in a mixed cluster |
+| `--onboot 0\|1` | `AGOS_ONBOOT` | 1 | start the VM when the host boots |
 | `--version VER` | `AGOS_VERSION` | `0.1.0` | release to install |
 | `--image-url URL` | `AGOS_IMAGE_URL` | GitHub release | https URL; `SHA256SUMS` must sit next to it |
 | `--image-file PATH` | `AGOS_IMAGE_FILE` | | local qcow2, no download |
@@ -215,8 +272,8 @@ Also: `AGOS_REPO` (default `kroqdotdev/agos`, for forks), `AGOS_CACHE_DIR`
 (default `/var/cache/agos`), `AGOS_MINISIGN_PUBKEY` (fork's signing key),
 `AGOS_POLL_INTERVAL` (seconds, default 5). Flags override environment.
 
-**Exit codes:** 0 ok (including "already exists"), 1 usage or confirmation
-needed (no TTY and no `--yes`), 2 preflight failed, 3 download or
+**Exit codes:** 0 ok (including "already exists"), 1 usage, confirmation
+needed (no TTY and no `--yes`) or the guided setup was cancelled, 2 preflight failed, 3 download or
 verification failed, 4 VM operation failed, 5 timed out waiting for first
 boot. Interactive prompts appear only when stdin and stderr are terminals and
 `--yes` is absent; without a terminal the script fails with exit 1 instead of
@@ -504,8 +561,9 @@ ssh agent@<vm-ip> sudo grep -E '^(VIEWER_PASSWORD|AGENTD_TOKEN)=' /etc/agos/secr
 ## Testing this directory
 
 ```bash
-deploy/proxmox/tests/run.sh          # shellcheck + the fake-Proxmox suite, in Docker
+deploy/proxmox/tests/run.sh          # shellcheck, the fake-Proxmox suite and the wizard render test, in Docker
 deploy/proxmox/tests/run.sh isolate  # one test
+deploy/proxmox/tests/run.sh render   # only the real-whiptail render test
 ```
 
 The suite runs the real script against stub `qm`, `pvesm`, `pvesh`,
@@ -517,3 +575,13 @@ arm64, dir storage, import fallback), idempotent re-runs, failure cleanup,
 timeouts, status, reset, destroy, no-TTY and TTY confirmation, `--isolate`,
 download/checksum/signature verification, truncated downloads, and that no
 secret ever reaches a command line, a log or stdout.
+
+The guided setup is tested twice. A fake `whiptail` replays scripted answers
+(OK, Cancel, ESC) on a pseudo-terminal through the default, LAN, advanced and
+existing-secrets paths, cancels at several points, and checks that the
+wizard stays off whenever flags, environment or a missing terminal ask for
+the unattended behaviour, and that typed secrets reach only the seed and the
+final box (never arguments, logs or the terminal). Then the real `whiptail`
+runs inside `tmux`, driven by `send-keys` through the default path to the
+summary and on to the final box; every screen is saved under
+`out/wizard-screens/`.

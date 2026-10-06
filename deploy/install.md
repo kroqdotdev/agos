@@ -48,6 +48,8 @@ DONE WHEN: `bash /root/agos-proxmox.sh status --json --name <NAME>` prints a JSO
    takes effect when the datacenter firewall is on.
 8. Do not read the generated passwords or tokens yourself. Give me the
    command that shows them.
+9. Never use the guided setup (`--wizard`, or the script with no arguments):
+   it is for humans at a terminal. Always pass the flags shown here.
 
 | Exit code | Meaning | What you do |
 |---|---|---|

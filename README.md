@@ -30,19 +30,24 @@ with a takeover button that pauses the agent.
 On the Proxmox host, as root:
 
 ```bash
-curl -fsSLO https://kroq.dev/tools/agos-proxmox.sh
-bash agos-proxmox.sh --dry-run          # shows exactly what it will do
-bash agos-proxmox.sh --yes
+bash -c "$(curl -fsSL https://kroq.dev/tools/agos-proxmox.sh)"
 ```
+
+A guided setup takes it from there: pick default or advanced settings, paste
+a Tailscale key (or choose LAN or SSH access), tick the SSH keys to allow, and
+confirm a summary before anything changes. Scripts and agents use the same
+script with flags instead (`--dry-run`, `--yes`, `--json`); see
+[`deploy/README.md`](deploy/README.md).
 
 The script checks every image against the release signing key
 (`RWQeJEg8BJM+C3FntUGlSkbqk9PU0z3FPLJS3z4fsjfXedsmchg2OFu1`) before using it.
 To verify the script itself first, use the signed release assets as shown in
 [`deploy/README.md`](deploy/README.md).
 
-Put secrets (Tailscale key, API keys) in `/root/agos.secrets` first; see
-[`deploy/README.md`](deploy/README.md). Other hypervisors (libvirt, Incus,
-UTM, VirtualBox, Hyper-V) use the same image and the same cloud-init seed.
+Secrets (Tailscale key, API keys) are entered in the guided setup or read
+from `/root/agos.secrets`; see [`deploy/README.md`](deploy/README.md). Other
+hypervisors (libvirt, Incus, UTM, VirtualBox, Hyper-V) use the same image and
+the same cloud-init seed.
 
 To have an agent do the install for you, point it at
 [`deploy/install.md`](deploy/install.md).

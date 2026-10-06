@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
 # agos-proxmox.sh - create and manage agos VMs on a Proxmox VE 8.x/9.x host.
 #
-# One-liner (shows the plan and asks before changing anything):
-#   bash -c "$(curl -fsSL --proto '=https' --tlsv1.2 https://raw.githubusercontent.com/kroqdotdev/agos/main/deploy/proxmox/agos-proxmox.sh)"
+# One-liner: on a terminal with no arguments it opens a guided setup
+# (whiptail dialogs); nothing changes until you confirm the summary.
+#   bash -c "$(curl -fsSL https://kroq.dev/tools/agos-proxmox.sh)"
 #
-# Run with --help for subcommands, flags and exit codes. Human docs:
+# With flags it runs unattended (agents, scripts): see --help for subcommands,
+# flags and exit codes. Human docs:
 # deploy/README.md; agent runbook: deploy/install.md; contract: docs/spec.md.
 #
 # Everything below is function definitions; main runs on the last line, so a
@@ -16,6 +18,7 @@ set -Eeuo pipefail
 AGOS_SCRIPT_VERSION="0.1.0"
 AGOS_DEFAULT_VERSION="0.1.0"
 AGOS_DEFAULT_REPO="kroqdotdev/agos"
+AGOS_SCRIPT_URL="https://kroq.dev/tools/agos-proxmox.sh"
 # Release signing key (the second line of minisign.pub, key id
 # 0B3E93043C48241E). Forks override it with AGOS_MINISIGN_PUBKEY, or set it
 # to "none" if they publish unsigned releases.
@@ -33,6 +36,10 @@ agos-proxmox.sh $AGOS_SCRIPT_VERSION - run agos (an unattended desktop for AI ag
 
 Usage: agos-proxmox.sh [create|status|reset|destroy] [flags]
 
+With no arguments on a terminal, create opens a guided setup (whiptail
+dialogs). Any of --json, --yes, --dry-run, another subcommand or --no-wizard
+keeps it off; agents and scripts always use flags.
+
 Subcommands:
   create    (default) download + verify the image, create the VM, boot it with a
             NoCloud seed, wait for first boot, take the 'golden' snapshot
@@ -41,6 +48,8 @@ Subcommands:
   destroy   delete an agos VM (needs --yes and --vmid or --name; agos-tagged VMs only)
 
 Flags (environment variable in brackets):
+  --wizard               open the guided setup (needs a terminal and whiptail)
+  --no-wizard            never open it, even with no arguments [AGOS_NO_WIZARD=1]
   --dry-run              check everything, print the plan, change nothing [AGOS_DRY_RUN=1]
   --json                 one JSON object on stdout; progress goes to stderr [AGOS_JSON=1]
   -y, --yes              do not ask for confirmation [AGOS_YES=1]
@@ -53,6 +62,7 @@ Flags (environment variable in brackets):
   --memory MiB           RAM in MiB (default: 8192) [AGOS_MEMORY]
   --disk SIZE            system disk size, e.g. 64G (default: 64G) [AGOS_DISK]
   --cpu TYPE             CPU type (default: host; x86-64-v2-AES for mixed clusters) [AGOS_CPU]
+  --onboot 0|1           start the VM when the host boots (default: 1) [AGOS_ONBOOT]
   --version VER          agos release (default: $AGOS_DEFAULT_VERSION) [AGOS_VERSION]
   --image-url URL        image URL; SHA256SUMS must sit next to it [AGOS_IMAGE_URL]
   --image-file PATH      local qcow2, no download (testing) [AGOS_IMAGE_FILE]
@@ -80,6 +90,7 @@ verification failed, 4 VM operation failed, 5 timed out waiting for first boot.
 
 Secrets are read only from --secrets-file, never from the command line, and are
 never printed. Examples:
+  agos-proxmox.sh                           # guided setup (on a terminal)
   agos-proxmox.sh --dry-run                 # plan only
   agos-proxmox.sh --yes --ssh-key-file /root/.ssh/authorized_keys   # the keys you log in to this host with
   agos-proxmox.sh status --json
@@ -90,9 +101,9 @@ EOF
 # ------------------------------------------------------------------ output
 
 setup_colors() {
-	C_RED="" C_YEL="" C_BLU="" C_BLD="" C_OFF=""
+	C_RED="" C_YEL="" C_BLU="" C_GRN="" C_BLD="" C_OFF=""
 	if [[ -t 2 && -z ${NO_COLOR:-} && ${TERM:-dumb} != dumb ]]; then
-		C_RED=$'\e[31m' C_YEL=$'\e[33m' C_BLU=$'\e[34m' C_BLD=$'\e[1m' C_OFF=$'\e[0m'
+		C_RED=$'\e[31m' C_YEL=$'\e[33m' C_BLU=$'\e[34m' C_GRN=$'\e[32m' C_BLD=$'\e[1m' C_OFF=$'\e[0m'
 	fi
 }
 
@@ -106,6 +117,10 @@ out() { printf '%s\n' "$*"; }
 die() {
 	local code=$1
 	shift
+	if [[ -n ${WIZ_STEP:-} ]]; then
+		log "  ${C_RED}${WIZ_BAD:-x}${C_OFF} $WIZ_STEP"
+		WIZ_STEP=""
+	fi
 	err "$*"
 	FAIL_MSG="$*"
 	DIED=1
@@ -255,6 +270,8 @@ init_settings() {
 	YES=${AGOS_YES:-0}
 	ISOLATE=${AGOS_ISOLATE:-0}
 	REQUIRE_SIG=${AGOS_REQUIRE_SIGNATURE:-0}
+	WIZARD=0
+	NO_WIZARD=${AGOS_NO_WIZARD:-0}
 	VMID_OPT=${AGOS_VMID:-}
 	NAME_OPT=${AGOS_NAME:-}
 	STORAGE_OPT=${AGOS_STORAGE:-}
@@ -264,6 +281,7 @@ init_settings() {
 	MEMORY=${AGOS_MEMORY:-8192}
 	DISK=${AGOS_DISK:-64G}
 	CPU_TYPE=${AGOS_CPU:-host}
+	ONBOOT=${AGOS_ONBOOT:-1}
 	VERSION=${AGOS_VERSION:-$AGOS_DEFAULT_VERSION}
 	IMAGE_URL_OPT=${AGOS_IMAGE_URL:-}
 	IMAGE_FILE_OPT=${AGOS_IMAGE_FILE:-}
@@ -300,13 +318,19 @@ init_settings() {
 	NAME=""
 	LAN_MODE=0
 	IMAGE_CACHED=0
+	SECRETS_LABEL=""
+	CONFIG_LABEL=""
+	WIZ_ACTIVE=0
+	WIZ_DIR=""
+	WIZ_STEP=""
+	WIZ_ACCESS=""
 	NODE=$(uname -n)
 	NODE=${NODE%%.*}
 }
 
 is_value_flag() {
 	case $1 in
-	--vmid | --name | --storage | --iso-storage | --bridge | --cores | --memory | --disk | --cpu | \
+	--vmid | --name | --storage | --iso-storage | --bridge | --cores | --memory | --disk | --cpu | --onboot | \
 		--version | --image-url | --image-file | --image-sha256 | --ssh-key-file | --secrets-file | \
 		--config-file | --network-config | --isolate-dns | --timeout) return 0 ;;
 	esac
@@ -324,6 +348,7 @@ set_opt() {
 	--memory) MEMORY=$2 ;;
 	--disk) DISK=$2 ;;
 	--cpu) CPU_TYPE=$2 ;;
+	--onboot) ONBOOT=$2 ;;
 	--version) VERSION=$2 ;;
 	--image-url) IMAGE_URL_OPT=$2 ;;
 	--image-file) IMAGE_FILE_OPT=$2 ;;
@@ -356,6 +381,8 @@ parse_args() {
 		-y | --yes) YES=1 ;;
 		--isolate) ISOLATE=1 ;;
 		--require-signature) REQUIRE_SIG=1 ;;
+		--wizard) WIZARD=1 ;;
+		--no-wizard) NO_WIZARD=1 ;;
 		--*=*)
 			is_value_flag "${a%%=*}" || usage_error "unknown flag: ${a%%=*}"
 			[[ -n ${a#*=} ]] || usage_error "${a%%=*} needs a value"
@@ -375,7 +402,7 @@ parse_args() {
 
 validate_settings() {
 	local b ip
-	for b in DRY_RUN JSON YES ISOLATE REQUIRE_SIG; do
+	for b in DRY_RUN JSON YES ISOLATE REQUIRE_SIG NO_WIZARD; do
 		[[ ${!b} =~ ^[01]$ ]] || usage_error "$b must be 0 or 1 (got '${!b}')"
 	done
 	[[ -z $VMID_OPT || $VMID_OPT =~ ^[1-9][0-9]{2,8}$ ]] || usage_error "--vmid must be a number between 100 and 999999999"
@@ -390,6 +417,7 @@ validate_settings() {
 		usage_error "--disk must look like 64G (at least 16G)"
 	fi
 	[[ $CPU_TYPE =~ ^[A-Za-z0-9._-]+$ ]] || usage_error "--cpu must be a CPU model such as host or x86-64-v2-AES"
+	[[ $ONBOOT =~ ^[01]$ ]] || usage_error "--onboot must be 0 or 1"
 	[[ $VERSION =~ ^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.]+)?$ ]] || usage_error "--version must look like 0.1.0"
 	[[ $TIMEOUT =~ ^[1-9][0-9]*$ ]] || usage_error "--timeout must be a positive number of seconds"
 	[[ $POLL_INTERVAL =~ ^[0-9]+(\.[0-9]+)?$ ]] || usage_error "AGOS_POLL_INTERVAL must be a number"
@@ -463,6 +491,10 @@ cleanup() {
 	seed_remove
 	if [[ -n $SEED_TMPDIR && -d $SEED_TMPDIR ]]; then
 		rm -rf -- "$SEED_TMPDIR"
+	fi
+	# The wizard's private secrets/config/keys files.
+	if [[ -n $WIZ_DIR && -d $WIZ_DIR ]]; then
+		rm -rf -- "$WIZ_DIR"
 	fi
 }
 
@@ -622,29 +654,49 @@ find_vm() {
 	return 1
 }
 
+# secrets_file_problem FILE: prints why FILE cannot be used (nothing if it can).
+# Reports line numbers, never content.
+secrets_file_problem() {
+	local f=$1 owner mode bad
+	if [[ ! -f $f || ! -r $f ]]; then
+		printf '%s is not a readable file\n' "$f"
+		return 0
+	fi
+	owner=$(stat -c %u -- "$f")
+	mode=$(stat -c %a -- "$f")
+	if [[ $owner != 0 ]]; then
+		printf '%s must be owned by root (run: chown root:root %s)\n' "$f" "$f"
+	elif (((8#$mode & 8#077) != 0)); then
+		printf '%s is readable by group or others (mode %s); run: chmod 600 %s\n' "$f" "$mode" "$f"
+	elif grep -q $'\r' -- "$f"; then
+		printf '%s has CRLF line endings; fix with: %s\n' "$f" "sed -i 's/\\r\$//' $f"
+	else
+		bad=$(awk '!/^[[:space:]]*(#|$)/ && !/^[A-Za-z_][A-Za-z0-9_]*=/ { printf "%s%d", s, NR; s = "," }' "$f")
+		if [[ -n $bad ]]; then printf '%s: line(s) %s are not KEY=value (values are not shown)\n' "$f" "$bad"; fi
+	fi
+}
+
+# Key names only.
+secret_keys_of() {
+	sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$1" | sort -u
+}
+
 check_secrets_file() {
 	SECRET_KEYS=()
 	HAS_TS=0
+	if [[ -z $SECRETS_FILE ]]; then
+		return 0
+	fi
 	if [[ ! -e $SECRETS_FILE ]]; then
 		((SECRETS_EXPLICIT == 0)) || die "$EX_PREFLIGHT" "secrets file $SECRETS_FILE not found"
 		warn "no secrets file at $SECRETS_FILE: the VM boots without Tailscale or API keys"
 		SECRETS_FILE=""
 		return 0
 	fi
-	[[ -f $SECRETS_FILE && -r $SECRETS_FILE ]] || die "$EX_PREFLIGHT" "$SECRETS_FILE is not a readable file"
-	local owner mode bad dup k
-	owner=$(stat -c %u -- "$SECRETS_FILE")
-	mode=$(stat -c %a -- "$SECRETS_FILE")
-	[[ $owner == 0 ]] || die "$EX_PREFLIGHT" "$SECRETS_FILE must be owned by root (run: chown root:root $SECRETS_FILE)"
-	(((8#$mode & 8#077) == 0)) ||
-		die "$EX_PREFLIGHT" "$SECRETS_FILE is readable by group or others (mode $mode); run: chmod 600 $SECRETS_FILE"
-	if grep -q $'\r' -- "$SECRETS_FILE"; then
-		die "$EX_PREFLIGHT" "$SECRETS_FILE has CRLF line endings; fix with: sed -i 's/\\r\$//' $SECRETS_FILE"
-	fi
-	# Line numbers only, never content.
-	bad=$(awk '!/^[[:space:]]*(#|$)/ && !/^[A-Za-z_][A-Za-z0-9_]*=/ { printf "%s%d", s, NR; s = "," }' "$SECRETS_FILE")
-	[[ -z $bad ]] || die "$EX_PREFLIGHT" "$SECRETS_FILE: line(s) $bad are not KEY=value (values are not shown)"
-	mapfile -t SECRET_KEYS < <(sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$SECRETS_FILE" | sort -u)
+	local problem dup k
+	problem=$(secrets_file_problem "$SECRETS_FILE")
+	[[ -z $problem ]] || die "$EX_PREFLIGHT" "$problem"
+	mapfile -t SECRET_KEYS < <(secret_keys_of "$SECRETS_FILE")
 	for k in "${SECRET_KEYS[@]}"; do
 		case $k in
 		TS_AUTHKEY | VIEWER_PASSWORD | AGENTD_TOKEN | ANTHROPIC_API_KEY | CLAUDE_CODE_OAUTH_TOKEN | OPENAI_API_KEY) ;;
@@ -713,12 +765,16 @@ free_kib_at() {
 	df -Pk -- "$d" | awk 'NR == 2 { print $4 }'
 }
 
-check_firewall_state() {
+dc_firewall_state() {
 	DC_FIREWALL=0
 	if [[ -r /etc/pve/firewall/cluster.fw ]] &&
 		awk '/^\[/ { s = toupper($0) } s == "[OPTIONS]" && /^[[:space:]]*enable:[[:space:]]*[1-9]/ { f = 1 } END { exit !f }' /etc/pve/firewall/cluster.fw; then
 		DC_FIREWALL=1
 	fi
+}
+
+check_firewall_state() {
+	dc_firewall_state
 	if [[ -e /etc/pve/firewall/$VMID.fw ]]; then
 		die "$EX_PREFLIGHT" "/etc/pve/firewall/$VMID.fw already exists (left over from an old VM?); remove it or pick another --vmid"
 	fi
@@ -962,18 +1018,20 @@ write_user_data() {
 	if [[ -n $CONFIG_FILE ]]; then
 		printf '%s\n' "  - path: /etc/agos/config.toml" "    owner: root:root" \
 			"    permissions: \"0644\"" "    encoding: b64"
-		printf '    content: '
+		# Quoted, so an empty file is "" rather than YAML null (which
+		# cloud-init's b64 decoder rejects); base64 never contains quotes.
+		printf "    content: '"
 		base64 -w0 -- "$CONFIG_FILE"
-		printf '\n'
+		printf "'\n"
 	fi
 	if [[ -n $SECRETS_FILE ]]; then
 		# Streamed straight from the file: secrets never pass through a shell
 		# variable or a command line, and b64 rules out YAML injection.
 		printf '%s\n' "  - path: /etc/agos/secrets.env" "    owner: root:root" \
 			"    permissions: \"0600\"" "    encoding: b64"
-		printf '    content: '
+		printf "    content: '"
 		base64 -w0 -- "$SECRETS_FILE"
-		printf '\n'
+		printf "'\n"
 	fi
 }
 
@@ -1117,15 +1175,20 @@ write_firewall() {
 	log "  + wrote $f"
 }
 
-isolate_warnings() {
-	warn "--isolate is EXPERIMENTAL: it writes firewall rules for this VM only (never cluster.fw or host rules)."
+isolate_warning_lines() {
+	printf '%s\n' "--isolate is EXPERIMENTAL: it writes firewall rules for this VM only (never cluster.fw or host rules)."
 	if ((DC_FIREWALL == 0)); then
-		warn "${C_BLD}The datacenter firewall is DISABLED, so these rules are NOT ENFORCED until an admin enables it.${C_OFF}"
-		warn "Enabling it (Datacenter > Firewall > Options) also turns on the host firewall with input policy DROP:"
-		warn "  only the cluster's local network keeps the GUI (8006) and SSH (22). If you manage the host from"
-		warn "  elsewhere (VPN, another subnet, a public IP) you can lock yourself out. Add your admin IPs to the"
-		warn "  'management' IPSet or set the input policy to ACCEPT first, keep a shell open, then enable it."
+		printf '%s\n' "The datacenter firewall is DISABLED, so these rules are NOT ENFORCED until an admin enables it." \
+			"Enabling it (Datacenter > Firewall > Options) also turns on the host firewall with input policy DROP:" \
+			"only the cluster's local network keeps the GUI (8006) and SSH (22). If you manage the host from" \
+			"elsewhere (VPN, another subnet, a public IP) you can lock yourself out. Add your admin IPs to the" \
+			"'management' IPSet or set the input policy to ACCEPT first, keep a shell open, then enable it."
 	fi
+}
+
+isolate_warnings() {
+	local l
+	while IFS= read -r l; do warn "$l"; done < <(isolate_warning_lines)
 }
 
 # ------------------------------------------------------------------ VM state
@@ -1237,7 +1300,7 @@ print_access() {
 		out "    or: ssh agent@$ip sudo grep -E '^(VIEWER_PASSWORD|AGENTD_TOKEN)=' /etc/agos/secrets.env"
 	fi
 	if ((I_GOLDEN)); then
-		out "  Reset to the first-boot state: agos-proxmox.sh reset --vmid $vmid --yes"
+		out "  Reset to the first-boot state: $SELF_CMD reset --vmid $vmid --yes"
 	else
 		out "  No 'golden' snapshot: reset is not available for this VM."
 	fi
@@ -1294,7 +1357,7 @@ plan_vm_commands() {
 	CMD_CREATE=(qm create "$VMID" --name "$NAME" --tags agos --ostype l26 --bios ovmf
 		--cpu "$CPU_TYPE" --cores "$CORES" --memory "$MEMORY" --balloon 0
 		--scsihw virtio-scsi-single --agent enabled=1 --net0 "$net0"
-		--vga virtio --tablet 1 --serial0 socket --onboot 1
+		--vga virtio --tablet 1 --serial0 socket --onboot "$ONBOOT"
 		--description "agos $VERSION ($HOST_ARCH), created by agos-proxmox.sh $AGOS_SCRIPT_VERSION on $(date -u +%Y-%m-%d). Manage with: agos-proxmox.sh status|reset|destroy --vmid $VMID")
 	if [[ $HOST_ARCH == amd64 ]]; then
 		CMD_CREATE+=(--machine q35)
@@ -1382,8 +1445,19 @@ print_plan() {
 	fi
 	out ""
 	out "agos-proxmox.sh $AGOS_SCRIPT_VERSION - plan (dry run: nothing will be changed)"
+	plan_summary
+	out ""
+	out "Commands:"
+	for c in "${PLAN[@]}"; do out "  $c"; done
+	out ""
+}
+
+# The plan in words, without the commands (dry run and the wizard summary).
+plan_summary() {
+	local c boot="starts at boot"
+	if ((ONBOOT == 0)); then boot="not started at boot"; fi
 	out "  host       Proxmox VE $PVE_VERSION, $HOST_ARCH, node $NODE"
-	out "  VM         $VMID '$NAME' (tag agos, starts at boot)"
+	out "  VM         $VMID '$NAME' (tag agos, $boot)"
 	out "  hardware   $CORES cores (cpu $CPU_TYPE), $MEMORY MiB, $DISK disk on $STORAGE ($STORAGE_TYPE), bridge $BRIDGE"
 	if [[ $IMAGE_SOURCE == file ]]; then
 		out "  image      $IMAGE_PATH (local file)"
@@ -1393,22 +1467,21 @@ print_plan() {
 	fi
 	out "  seed       NoCloud ISO (label CIDATA) on '$ISO_STORAGE', deleted after first boot"
 	if [[ -n $SECRETS_FILE ]]; then
-		out "             secrets from $SECRETS_FILE: ${SECRET_KEYS[*]:-(no keys)} (values never shown)"
+		out "             secrets from ${SECRETS_LABEL:-$SECRETS_FILE}: ${SECRET_KEYS[*]:-(no keys)} (values never shown)"
 	else
 		out "             no secrets file"
 	fi
-	out "             config: ${CONFIG_FILE:-image defaults}; network: ${NETCFG_FILE:-DHCP}; SSH keys for 'agent': ${#SSH_KEYS[@]}"
-	if ((ISOLATE)); then
+	out "             config: ${CONFIG_LABEL:-${CONFIG_FILE:-image defaults}}; network: ${NETCFG_FILE:-DHCP}; SSH keys for 'agent': ${#SSH_KEYS[@]}"
+	if [[ -n $WIZ_ACCESS ]]; then out "  access     $(wiz_access_text)"; fi
+	if ((ISOLATE && WIZ_ACTIVE)); then
+		out "  isolate    EXPERIMENTAL: drops traffic to LAN, link-local/metadata, CGNAT, loopback and ULA (datacenter firewall: $( ((DC_FIREWALL)) && printf enabled || printf 'DISABLED, not enforced'); rules under 'Show the exact commands')"
+	elif ((ISOLATE)); then
 		out "  isolate    EXPERIMENTAL egress rules in /etc/pve/firewall/$VMID.fw (datacenter firewall: $( ((DC_FIREWALL)) && printf enabled || printf 'DISABLED, not enforced'))"
 		while IFS= read -r c; do out "               $c"; done < <(firewall_rules | grep -E '^(OUT|IN) ')
 	else
 		out "  isolate    no: the VM can reach your LAN (see --isolate)"
 	fi
 	out "  then       start, wait up to ${TIMEOUT}s for first boot, remove the seed, snapshot 'golden'"
-	out ""
-	out "Commands:"
-	for c in "${PLAN[@]}"; do out "  $c"; done
-	out ""
 }
 
 print_plan_brief() {
@@ -1492,8 +1565,8 @@ report_existing() {
 	exit 0
 }
 
-cmd_create() {
-	local lockdir=/run/lock
+# Everything create checks and decides before changing anything.
+create_preflight() {
 	phase "$EX_PREFLIGHT"
 	require_root
 	check_tools
@@ -1524,7 +1597,10 @@ cmd_create() {
 	fi
 	if ((ISOLATE)); then isolate_warnings; fi
 	plan_vm_commands
+}
 
+cmd_create() {
+	create_preflight
 	if ((DRY_RUN)); then
 		check_image_reachable
 		record_plan
@@ -1534,10 +1610,13 @@ cmd_create() {
 		fi
 		return 0
 	fi
-
 	if ((JSON == 0)); then print_plan_brief; fi
 	confirm "Create VM $VMID '$NAME' on $STORAGE?"
+	create_execute
+}
 
+create_execute() {
+	local lockdir=/run/lock
 	if [[ ! -d $lockdir || ! -w $lockdir ]]; then lockdir=/tmp; fi
 	exec 9>"$lockdir/agos-proxmox.lock"
 	if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
@@ -1574,6 +1653,7 @@ cmd_create() {
 	if ((JSON)); then
 		emit_vm_json create "$VMID" "$NAME" "$NODE" 0
 	else
+		if ((WIZ_ACTIVE)); then wiz_final; fi
 		print_access "$VMID" "$NAME"
 		out "  Image: agos $VERSION, checksum $CHECKSUM_STATUS, signature $SIG_STATUS"
 	fi
@@ -1766,6 +1846,728 @@ cmd_destroy() {
 	fi
 }
 
+# ------------------------------------------------------------------ guided setup (whiptail)
+#
+# A bare `bash -c "$(curl ...)"` on a terminal lands here. Every choice is a
+# dialog and every answer lands in the variables the flags set, so the create
+# flow underneath is the same one agents drive with flags. Dialogs are drawn
+# on /dev/tty, which also makes `curl ... | bash` work. Secrets typed here
+# stay in shell variables and in one private temp file that only feeds the
+# seed: they are written with the printf builtin, never passed as an argument
+# (not even to whiptail) and never printed.
+
+wizard_tty_ok() {
+	[[ -t 1 && -n ${TERM:-} && $TERM != dumb ]] || return 1
+	{ true </dev/tty >/dev/tty; } 2>/dev/null
+}
+
+decide_wizard() {
+	WIZ_ACTIVE=0
+	if ((WIZARD && NO_WIZARD)); then usage_error "--wizard and --no-wizard contradict each other"; fi
+	if ((WIZARD)); then
+		[[ $ACTION == create ]] || usage_error "--wizard only applies to create"
+		if ((JSON || YES || DRY_RUN)); then
+			usage_error "--wizard is interactive and cannot be combined with --json, --yes or --dry-run"
+		fi
+		wizard_tty_ok || usage_error "--wizard needs a terminal (stdout and /dev/tty, TERM set)"
+		WIZ_ACTIVE=1
+	elif ((NO_WIZARD == 0 && JSON == 0 && YES == 0 && DRY_RUN == 0)) && [[ $ACTION == create ]] &&
+		{ ((ARGC == 0)) || [[ $ARGC == 1 && $ACTION_SET == 1 ]]; } && wizard_tty_ok; then
+		WIZ_ACTIVE=1
+	fi
+	if ((WIZ_ACTIVE)) && [[ -n $CONFIG_FILE ]]; then
+		usage_error "the guided setup writes its own config.toml; drop --config-file (or use flags without the wizard)"
+	fi
+	if ((WIZ_ACTIVE)) && ! command -v whiptail >/dev/null 2>&1; then
+		die "$EX_PREFLIGHT" "the guided setup needs whiptail: apt install whiptail (or run with flags, see --help)"
+	fi
+	return 0
+}
+
+wiz_dims() {
+	local size
+	WIZ_ROWS=24 WIZ_COLS=80
+	if size=$(stty size </dev/tty 2>/dev/null) && [[ $size =~ ^([0-9]+)\ ([0-9]+)$ ]] &&
+		((BASH_REMATCH[1] > 0 && BASH_REMATCH[2] > 0)); then
+		WIZ_ROWS=${BASH_REMATCH[1]} WIZ_COLS=${BASH_REMATCH[2]}
+	fi
+	if ((WIZ_ROWS < 20 || WIZ_COLS < 70)); then
+		die "$EX_USAGE" "the terminal is ${WIZ_COLS}x${WIZ_ROWS}; the guided setup needs at least 70x20 (or run with flags, see --help)"
+	fi
+	WIZ_W=$((WIZ_COLS - 6))
+	if ((WIZ_W > 78)); then WIZ_W=78; fi
+}
+
+# wiz_h N: a dialog height of N rows, capped to the terminal.
+wiz_h() {
+	local h=$1
+	if ((h > WIZ_ROWS - 2)); then h=$((WIZ_ROWS - 2)); fi
+	printf '%s' "$h"
+}
+
+# wiz_rows TEXT: rows TEXT needs once whiptail wraps it (with some slack for
+# word wrapping), so dialogs can be sized to fit instead of scrolling.
+wiz_rows() {
+	local width=$((WIZ_W - 6)) line rows=0
+	while IFS= read -r line; do
+		rows=$((rows + (${#line} + width - 1) / width))
+		if ((${#line} == 0)); then rows=$((rows + 1)); fi
+	done < <(printf '%b\n' "$1")
+	printf '%s' $((rows + rows / 6))
+}
+
+# wiz_hfor TEXT EXTRA: a dialog height for TEXT plus EXTRA rows of chrome.
+wiz_hfor() {
+	wiz_h $(($(wiz_rows "$1") + $2))
+}
+
+# Long, pre-formatted text (summary, commands, final box): fold it to the box
+# width and size the box to it. Only a box that still does not fit scrolls,
+# and then it says so: in a scrolling box newt focuses the text and Enter
+# does nothing until you Tab to the button.
+WIZ_SCROLL_HINT="(Scroll with the arrow keys; press Tab, then Enter to go on.)"
+wiz_fold() {
+	local nl
+	# Wrap at spaces with a hanging indent under the value column, so
+	# "  label      value ..." continues aligned.
+	WIZ_FOLDED=$(awk -v w=$((WIZ_W - 6)) '
+		{
+			line = $0
+			ind = 0
+			if (match(line, /^ *[A-Za-z]+:? {2,}/)) ind = RLENGTH
+			else if (match(line, /^ +/)) ind = RLENGTH
+			if (ind > w / 2) ind = 0
+			pad = sprintf("%" ind "s", "")
+			while (length(line) > w) {
+				cut = w
+				while (cut > ind + 1 && substr(line, cut + 1, 1) != " ") cut--
+				if (cut <= ind + 1) cut = w
+				print substr(line, 1, cut)
+				rest = substr(line, cut + 1)
+				sub(/^ +/, "", rest)
+				line = pad rest
+			}
+			print line
+		}')
+	nl=${WIZ_FOLDED//[!$'\n']/}
+	WIZ_BOX_H=$((${#nl} + 1 + 7))
+	WIZ_BOX_FLAGS=()
+	if ((WIZ_BOX_H > WIZ_ROWS - 2)); then
+		WIZ_BOX_H=$((WIZ_ROWS - 2))
+		WIZ_BOX_FLAGS=(--scrolltext)
+		WIZ_FOLDED="$WIZ_SCROLL_HINT"$'\n\n'"$WIZ_FOLDED"
+	fi
+}
+
+# wt ARGS...: whiptail on the terminal; the answer comes out on stdout.
+wt() {
+	whiptail --output-fd 3 --backtitle "agos $AGOS_SCRIPT_VERSION - Proxmox VE guided setup" "$@" \
+		3>&1 1>/dev/tty 2>/dev/tty </dev/tty
+}
+
+wiz_abort() {
+	die "$EX_USAGE" "aborted, nothing changed"
+}
+
+# wiz_ask VAR ARGS...: OK stores the answer in VAR; Cancel and ESC abort.
+wiz_ask() {
+	local __var=$1 __ans __rc=0
+	shift
+	__ans=$(wt "$@") || __rc=$?
+	if ((__rc != 0)); then wiz_abort; fi
+	printf -v "$__var" '%s' "$__ans"
+}
+
+# wiz_yesno ARGS...: Yes is 0 and No is 1; ESC aborts.
+wiz_yesno() {
+	local rc=0
+	wt "$@" >/dev/null || rc=$?
+	case $rc in
+	0) return 0 ;;
+	1) return 1 ;;
+	*) wiz_abort ;;
+	esac
+}
+
+wiz_msg() {
+	# title text
+	wt --title "$1" --msgbox "$2" "$(wiz_hfor "$2" 7)" "$WIZ_W" >/dev/null || wiz_abort
+}
+
+# Show stdin in a scrolling box without putting it in argv or a file: perl
+# copies it into an anonymous memfd and whiptail reads that through /dev/fd.
+# Returns 97 if this kernel cannot do it, so the caller can fall back.
+wiz_textbox_stdin() {
+	# title height [whiptail flags...]
+	local title=$1 height=$2 nr
+	shift 2
+	case $(uname -m) in
+	x86_64) nr=319 ;;
+	aarch64) nr=279 ;;
+	*) return 97 ;;
+	esac
+	# shellcheck disable=SC2016
+	perl -MPOSIX -e '
+		my ($nr, @args) = @ARGV;
+		my $name = "agos-summary";
+		my $fd = syscall($nr, $name, 0);
+		exit 97 if !defined $fd || $fd < 0;
+		my $data = do { local $/; <STDIN> } // "";
+		my $off = 0;
+		while ($off < length $data) {
+			my $w = POSIX::write($fd, substr($data, $off), length($data) - $off);
+			exit 97 unless defined $w && $w > 0;
+			$off += $w;
+		}
+		open(STDIN, "<", "/dev/tty") && open(STDOUT, ">", "/dev/tty") && open(STDERR, ">", "/dev/tty") or exit 97;
+		exec { "whiptail" } "whiptail", map { $_ eq "\@FD\@" ? "/dev/fd/$fd" : $_ } @args;
+		exit 97;
+	' "$nr" --backtitle "agos $AGOS_SCRIPT_VERSION - Proxmox VE guided setup" --title "$title" \
+		"$@" --textbox @FD@ "$height" "$WIZ_W"
+}
+
+wiz_utf8() {
+	[[ ${LC_ALL:-${LC_CTYPE:-${LANG:-}}} =~ [Uu][Tt][Ff]-?8 ]]
+}
+
+wiz_ok() { log "  ${C_GRN}${WIZ_TICK}${C_OFF} $1"; }
+
+wiz_banner() {
+	printf '\e[H\e[2J' >/dev/tty
+	log ""
+	log "${C_BLD}   __ _  __ _  ___  ___${C_OFF}"
+	log "${C_BLD}  / _\` |/ _\` |/ _ \\/ __|${C_OFF}   agos $AGOS_SCRIPT_VERSION - an unattended desktop for AI agents"
+	log "${C_BLD} | (_| | (_| | (_) \\__ \\${C_OFF}   guided setup for Proxmox VE"
+	log "${C_BLD}  \\__,_|\\__, |\\___/|___/${C_OFF}"
+	log "${C_BLD}        |___/${C_OFF}            nothing changes until you confirm the summary"
+	log ""
+}
+
+wiz_preflight() {
+	WIZ_TICK="ok" WIZ_BAD="!!"
+	if wiz_utf8; then WIZ_TICK="✓" WIZ_BAD="✗"; fi
+	WIZ_STEP="running as root"
+	require_root
+	wiz_ok "running as root"
+	WIZ_STEP="Proxmox VE tools"
+	check_tools
+	check_pve_version
+	wiz_ok "Proxmox VE $PVE_VERSION"
+	WIZ_STEP="architecture"
+	check_arch
+	wiz_ok "architecture $HOST_ARCH"
+	WIZ_STEP="KVM"
+	check_kvm
+	wiz_ok "KVM available"
+	WIZ_STEP="VM list"
+	load_vms
+	WIZ_STEP=""
+	wiz_ok "whiptail"
+	log ""
+}
+
+wiz_secret_put() {
+	# key value: append to the private secrets file (builtin printf: no argv)
+	printf '%s=%s\n' "$1" "$2" >>"$WIZ_SECRETS"
+}
+
+wiz_has_key() {
+	grep -q "^$1=[^[:space:]]" -- "$WIZ_SECRETS"
+}
+
+viewer_password_ok() {
+	local p=$1
+	((${#p} >= 8 && ${#p} <= 128)) || return 1
+	[[ $p =~ ^[[:print:]]+$ && $p != [[:space:]]* && $p != *[[:space:]] ]] || return 1
+	# The guest strips one pair of surrounding quotes from env values.
+	[[ ! $p =~ ^\'.*\'$ && ! $p =~ ^\".*\"$ ]]
+}
+
+api_secret_ok() {
+	[[ $1 =~ ^[A-Za-z0-9._~+/=:-]{8,512}$ ]]
+}
+
+ssh_pubkey_ok() {
+	[[ $1 =~ ^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-(ssh-ed25519|ecdsa-sha2-nistp256)@openssh\.com)\ AAAA[A-Za-z0-9+/=]+(\ .*)?$ ]]
+}
+
+# "type blob comment" for each distinct public key in an authorized_keys file
+# (options such as from="..." are dropped).
+authorized_key_rows() {
+	awk '
+		/^[[:space:]]*(#|$)/ { next }
+		{
+			for (i = 1; i < NF; i++) {
+				if ($i ~ /^(ssh-(ed25519|rsa|dss)|ecdsa-sha2-nistp(256|384|521)|sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)$/ &&
+					$(i + 1) ~ /^AAAA[A-Za-z0-9+\/=]+$/) {
+					if (seen[$(i + 1)]++) next
+					c = ""
+					for (j = i + 2; j <= NF; j++) c = c (c == "" ? "" : " ") $j
+					print $i, $(i + 1), c
+					next
+				}
+			}
+		}' "$1"
+}
+
+ssh_fingerprint() {
+	local fp
+	fp=$(printf '%s' "$1" | base64 -d 2>/dev/null | openssl dgst -sha256 -binary 2>/dev/null | base64 -w0 2>/dev/null) || fp=""
+	fp=${fp//=/}
+	if [[ -n $fp ]]; then printf 'SHA256:%s' "${fp:0:10}"; fi
+}
+
+wiz_access_text() {
+	case $WIZ_ACCESS in
+	tailscale)
+		local kind="auth key"
+		if [[ ${WIZ_TS_KIND:-} == client ]]; then kind="OAuth client secret"; fi
+		printf 'Tailscale (%s, tags: %s)' "$kind" "${WIZ_TS_TAGS:-none}"
+		;;
+	lan)
+		local pw="generated at first boot"
+		if wiz_has_key VIEWER_PASSWORD; then pw="set"; fi
+		printf 'LAN: https://<vm-ip>:8444, user agos, password %s; Tailscale off' "$pw"
+		;;
+	ssh) printf 'SSH tunnel only; Tailscale off' ;;
+	esac
+}
+
+wiz_defaults() {
+	local i n=2 best=-1
+	WIZ_NEXTID=$(pvesh get /cluster/nextid 2>/dev/null | tr -dc '0-9') || true
+	[[ -n $WIZ_NEXTID ]] || die "$EX_PREFLIGHT" "pvesh get /cluster/nextid returned no VMID"
+	NAME=${NAME_OPT:-agos}
+	if [[ -z $NAME_OPT ]]; then
+		while find_vm "" "$NAME"; do
+			NAME="agos-$n"
+			n=$((n + 1))
+		done
+	fi
+	load_storages images
+	WIZ_ST_ITEMS=()
+	for i in "${!ST_NAME[@]}"; do
+		[[ ${ST_STATUS[i]} == active ]] || continue
+		WIZ_ST_ITEMS+=("${ST_NAME[i]}" "${ST_TYPE[i]}, $((ST_AVAIL[i] / 1024 / 1024)) GiB free")
+		if ((best < 0)) || ((ST_AVAIL[i] > ST_AVAIL[best])); then best=$i; fi
+	done
+	((best >= 0)) || die "$EX_PREFLIGHT" "no active storage for VM disks (see: pvesm status --content images)"
+	WIZ_ST_BEST=${STORAGE_OPT:-${ST_NAME[best]}}
+	mapfile -t WIZ_BRIDGES < <(ip -o link show type bridge 2>/dev/null |
+		awk -F': ' '{ sub(/@.*/, "", $2); if ($2 !~ /^fwbr/) print $2 }' | sort -u)
+	if ((${#WIZ_BRIDGES[@]})) && ! printf '%s\n' "${WIZ_BRIDGES[@]}" | grep -qx -- "$BRIDGE"; then
+		BRIDGE=${WIZ_BRIDGES[0]}
+	fi
+}
+
+wiz_advanced() {
+	local v items=() b n text
+	while true; do
+		wiz_ask v --title "VM ID" --inputbox "Proxmox VMID for the new VM:" 9 "$WIZ_W" "${VMID_OPT:-$WIZ_NEXTID}"
+		if [[ $v =~ ^[1-9][0-9]{2,8}$ ]] && pvesh get /cluster/nextid --vmid "$v" >/dev/null 2>&1; then
+			VMID_OPT=$v
+			break
+		fi
+		wiz_msg "VM ID" "VMID '$v' is not valid or already in use. Pick a free number from 100 up."
+	done
+	while true; do
+		wiz_ask v --title "Name" --inputbox "VM name (also the guest's hostname and its Tailscale name):" 9 "$WIZ_W" "$NAME"
+		if [[ ! $v =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?$ ]]; then
+			wiz_msg "Name" "'$v' is not a valid hostname: letters, digits and '-', at most 63 characters."
+		elif find_vm "" "$v"; then
+			wiz_msg "Name" "A VM named '$v' already exists (VMID $F_VMID). Pick another name."
+		else
+			NAME_OPT=$v NAME=$v
+			break
+		fi
+	done
+	n=$((${#WIZ_ST_ITEMS[@]} / 2))
+	wiz_ask STORAGE_OPT --title "Storage" --default-item "$WIZ_ST_BEST" \
+		--menu "Storage for the VM's disks (needs the 'images' content type):" \
+		"$(wiz_h $((n + 9)))" "$WIZ_W" "$n" "${WIZ_ST_ITEMS[@]}"
+	if ((${#WIZ_BRIDGES[@]})); then
+		items=()
+		for b in "${WIZ_BRIDGES[@]}"; do items+=("$b" "Linux bridge"); done
+		wiz_ask BRIDGE --title "Network" --default-item "$BRIDGE" \
+			--menu "Bridge for the VM's network card:" "$(wiz_h $((${#WIZ_BRIDGES[@]} + 9)))" "$WIZ_W" \
+			"${#WIZ_BRIDGES[@]}" "${items[@]}"
+	else
+		wiz_ask BRIDGE --title "Network" --inputbox "No Linux bridges found. Bridge name for the VM's network card:" 9 "$WIZ_W" "$BRIDGE"
+	fi
+	n=$(nproc 2>/dev/null || printf 4)
+	while true; do
+		wiz_ask v --title "CPU" --inputbox "vCPU cores (this host has $n):" 9 "$WIZ_W" "$CORES"
+		if [[ $v =~ ^[1-9][0-9]{0,2}$ ]] && ((v <= n)); then
+			CORES=$v
+			break
+		fi
+		wiz_msg "CPU" "Enter a number from 1 to $n."
+	done
+	while true; do
+		wiz_ask v --title "Memory" --inputbox "RAM in MiB (at least 2048; 8192 recommended):" 9 "$WIZ_W" "$MEMORY"
+		if [[ $v =~ ^[1-9][0-9]{3,6}$ ]] && ((v >= 2048)); then
+			MEMORY=$v
+			break
+		fi
+		wiz_msg "Memory" "Enter a size in MiB, at least 2048."
+	done
+	while true; do
+		wiz_ask v --title "Disk" --inputbox "System disk size in GiB (at least 16):" 9 "$WIZ_W" "${DISK%G}"
+		if [[ $v =~ ^[1-9][0-9]{0,4}$ ]] && ((v >= 16)); then
+			DISK="${v}G"
+			break
+		fi
+		wiz_msg "Disk" "Enter a size in GiB, at least 16."
+	done
+	if [[ $HOST_ARCH == amd64 ]]; then
+		wiz_ask CPU_TYPE --title "CPU type" --default-item "$CPU_TYPE" --menu "CPU model the VM sees:" 12 "$WIZ_W" 2 \
+			host "Host CPU: fastest; no live migration to other CPU models" \
+			x86-64-v2-AES "Portable: live migration in mixed clusters"
+	fi
+	if wiz_yesno --title "Start at boot" --yesno "Start this VM automatically when the Proxmox host boots?" 8 "$WIZ_W"; then
+		ONBOOT=1
+	else
+		ONBOOT=0
+	fi
+	ISOLATE=0
+	text="Keep the VM off your LAN?\n\nThe host firewall then drops the VM's traffic to private networks (RFC 1918), link-local and cloud metadata, CGNAT, loopback and IPv6 ULA addresses. Internet access and DNS via your gateway keep working.\n\nExperimental."
+	if wiz_yesno --title "Isolation (experimental)" --defaultno --yesno "$text" "$(wiz_hfor "$text" 7)" "$WIZ_W"; then
+		ISOLATE=1
+		dc_firewall_state
+		if ((DC_FIREWALL == 0)); then
+			text="$(isolate_warning_lines | tr '\n' ' ')\n\nKeep isolation on anyway?"
+			if ! wiz_yesno --title "Isolation (experimental)" --defaultno --yesno "$text" "$(wiz_hfor "$text" 7)" "$WIZ_W"; then
+				ISOLATE=0
+			fi
+		fi
+	fi
+}
+
+wiz_existing_secrets() {
+	local f=$SECRETS_FILE problem keys text
+	WIZ_SECRETS_FROM=""
+	[[ -e $f ]] || return 0
+	problem=$(secrets_file_problem "$f")
+	if [[ -n $problem ]]; then
+		wiz_msg "Existing secrets" "Found $f but cannot use it:\n\n$problem\n\nContinuing without it; the next steps ask for what you need."
+		return 0
+	fi
+	keys=$(secret_keys_of "$f" | tr '\n' ' ')
+	text="Found $f with these keys (values are not shown):\n\n  ${keys:-(none)}\n\nUse them for this VM? You will only be asked for what is missing."
+	if wiz_yesno --title "Existing secrets" --yesno "$text" "$(wiz_hfor "$text" 7)" "$WIZ_W"; then
+		cat -- "$f" >>"$WIZ_SECRETS"
+		printf '\n' >>"$WIZ_SECRETS"
+		WIZ_SECRETS_FROM=$f
+	fi
+}
+
+wiz_ts_tags() {
+	local v t ok tags=() text
+	text="Tags for the VM, separated by spaces (empty = none).\n\nOAuth client secrets (tskey-client-) need at least one tag the client may assign. Auth keys (tskey-auth-) join untagged unless your tailnet policy's tagOwners lets you use the tag."
+	while true; do
+		wiz_ask v --title "Tailscale tags" --inputbox "$text" "$(wiz_hfor "$text" 8)" "$WIZ_W" "$WIZ_TS_TAGS"
+		read -ra tags <<<"${v//,/ }"
+		ok=1
+		for t in "${tags[@]}"; do
+			if [[ ! $t =~ ^tag:[A-Za-z0-9-]+$ ]]; then ok=0; fi
+		done
+		if ((ok == 0)); then
+			wiz_msg "Tailscale tags" "Tags look like tag:agos (letters, digits and '-' after 'tag:')."
+		elif [[ $WIZ_TS_KIND == client && ${#tags[@]} -eq 0 ]]; then
+			wiz_msg "Tailscale tags" "An OAuth client secret can only create tagged devices: enter at least one tag."
+		else
+			WIZ_TS_TAGS="${tags[*]}"
+			break
+		fi
+	done
+}
+
+wiz_access() {
+	local v="" text
+	WIZ_TS_KIND="" WIZ_TS_TAGS=""
+	wiz_ask WIZ_ACCESS --title "Access" --default-item tailscale --menu \
+		"How will you reach the agos desktop and its agent API?" 11 "$WIZ_W" 3 \
+		tailscale "Tailscale: https://<name>.<tailnet>.ts.net (recommended)" \
+		lan "LAN: https://<vm-ip>:8444 with a password" \
+		ssh "SSH tunnel only: nothing listens on the network"
+	case $WIZ_ACCESS in
+	tailscale)
+		if wiz_has_key TS_AUTHKEY; then
+			wiz_msg "Tailscale" "Using TS_AUTHKEY from $WIZ_SECRETS_FROM."
+		else
+			text="Paste a Tailscale key. Recommended: an OAuth client secret (tskey-client-...) with the auth_keys scope and tag:agos; it does not expire. A plain auth key (tskey-auth-...) also works but expires after at most 90 days.\n\nThe key only goes into the VM's first-boot seed."
+			while true; do
+				wiz_ask v --title "Tailscale key" --passwordbox "$text" "$(wiz_hfor "$text" 8)" "$WIZ_W"
+				v=${v//[[:space:]]/}
+				if [[ $v =~ ^tskey-[A-Za-z0-9_-]+$ ]]; then break; fi
+				v=""
+				wiz_msg "Tailscale key" "That is not a Tailscale key: it must start with tskey- (tskey-client-... or tskey-auth-...). Paste it again, or press ESC to quit."
+			done
+			wiz_secret_put TS_AUTHKEY "$v"
+			v=""
+		fi
+		WIZ_TS_KIND=auth
+		if grep -q '^TS_AUTHKEY=tskey-client-' -- "$WIZ_SECRETS"; then WIZ_TS_KIND=client; fi
+		if [[ $WIZ_TS_KIND == client ]]; then WIZ_TS_TAGS="tag:agos"; fi
+		if ((WIZ_ADVANCED)); then wiz_ts_tags; fi
+		;;
+	lan)
+		if ! wiz_has_key VIEWER_PASSWORD; then
+			text="Password for the desktop (user 'agos'). Leave it blank to have one generated at first boot; it is shown at the end."
+			while true; do
+				wiz_ask v --title "Desktop password" --passwordbox "$text" "$(wiz_hfor "$text" 8)" "$WIZ_W"
+				if [[ -z $v ]] || viewer_password_ok "$v"; then break; fi
+				v=""
+				wiz_msg "Desktop password" "Use 8 to 128 printable characters, without spaces at the start or end."
+			done
+			if [[ -n $v ]]; then wiz_secret_put VIEWER_PASSWORD "$v"; fi
+			v=""
+		fi
+		;;
+	esac
+}
+
+wiz_ssh_keys() {
+	local f=${SSH_KEY_FILE:-/root/.ssh/authorized_keys} rows=() items=() picked="" v i ktype kblob kcomment fp n text
+	WIZ_SSH="$WIZ_DIR/ssh_keys.pub"
+	while true; do
+		: >"$WIZ_SSH"
+		rows=()
+		if [[ -r $f ]]; then mapfile -t rows < <(authorized_key_rows "$f"); fi
+		if ((${#rows[@]})); then
+			items=()
+			for i in "${!rows[@]}"; do
+				read -r ktype kblob kcomment <<<"${rows[i]}"
+				fp=$(ssh_fingerprint "$kblob")
+				items+=("$((i + 1))" "$ktype ${fp:+$fp }${kcomment:-(no comment)}" ON)
+			done
+			text="Public keys that may log in as 'agent' over SSH, from $f (the keys you log in to this host with). Space toggles, Enter confirms."
+			wiz_ask picked --title "SSH keys" --separate-output --checklist "$text" \
+				"$(wiz_hfor "$text" $((${#rows[@]} + 7)))" "$WIZ_W" "${#rows[@]}" "${items[@]}"
+			while read -r i; do
+				if [[ $i =~ ^[0-9]+$ ]] && ((i >= 1 && i <= ${#rows[@]})); then
+					printf '%s\n' "${rows[i - 1]}" >>"$WIZ_SSH"
+				fi
+			done < <(printf '%s\n' "$picked")
+		fi
+		while true; do
+			wiz_ask v --title "SSH keys" --inputbox "Paste one more public key for 'agent' (optional, blank = none):" 10 "$WIZ_W"
+			if [[ -z ${v//[[:space:]]/} ]]; then break; fi
+			if ssh_pubkey_ok "$v"; then
+				printf '%s\n' "$v" >>"$WIZ_SSH"
+				break
+			fi
+			wiz_msg "SSH keys" "That is not an SSH public key (it should start with ssh-ed25519, ssh-rsa or ecdsa-sha2-...). Never paste a private key."
+		done
+		n=$(grep -c . "$WIZ_SSH" || true)
+		if ((n > 0)) || [[ $WIZ_ACCESS != ssh ]]; then break; fi
+		text="No SSH key selected. With SSH-tunnel access you could then only reach the VM through 'qm guest exec' on this host.\n\nContinue without an SSH key?"
+		if wiz_yesno --title "SSH keys" --defaultno --yesno "$text" "$(wiz_hfor "$text" 7)" "$WIZ_W"; then
+			break
+		fi
+	done
+	if ((n > 0)); then SSH_KEY_FILE=$WIZ_SSH; else SSH_KEY_FILE=""; fi
+}
+
+wiz_agent_creds() {
+	local v="" kind text
+	if ! wiz_has_key ANTHROPIC_API_KEY && ! wiz_has_key CLAUDE_CODE_OAUTH_TOKEN; then
+		text="Anthropic API key (sk-ant-api...) or Claude Code OAuth token (sk-ant-oat..., from 'claude setup-token') for Claude Code in the VM. Blank = skip.\n\nUse a key with a spend limit: assume anything inside the VM can leak."
+		while true; do
+			wiz_ask v --title "Claude credentials (optional)" --passwordbox "$text" "$(wiz_hfor "$text" 8)" "$WIZ_W"
+			v=${v//[[:space:]]/}
+			if [[ -z $v ]] || api_secret_ok "$v"; then break; fi
+			v=""
+			wiz_msg "Claude credentials" "That does not look like an API key or token. Paste it again, or leave it blank to skip."
+		done
+		if [[ -n $v ]]; then
+			case $v in
+			sk-ant-oat*) kind=CLAUDE_CODE_OAUTH_TOKEN ;;
+			sk-ant-api*) kind=ANTHROPIC_API_KEY ;;
+			*)
+				wiz_ask kind --title "Claude credentials" --menu "Which kind of credential is this?" 11 "$WIZ_W" 2 \
+					ANTHROPIC_API_KEY "Anthropic API key" CLAUDE_CODE_OAUTH_TOKEN "Claude Code OAuth token"
+				;;
+			esac
+			wiz_secret_put "$kind" "$v"
+		fi
+		v=""
+	fi
+	if ! wiz_has_key OPENAI_API_KEY; then
+		while true; do
+			wiz_ask v --title "OpenAI key (optional)" --passwordbox "OpenAI API key for agents in the VM. Blank = skip." 9 "$WIZ_W"
+			v=${v//[[:space:]]/}
+			if [[ -z $v ]] || api_secret_ok "$v"; then break; fi
+			v=""
+			wiz_msg "OpenAI key" "That does not look like an API key. Paste it again, or leave it blank to skip."
+		done
+		if [[ -n $v ]]; then wiz_secret_put OPENAI_API_KEY "$v"; fi
+		v=""
+	fi
+}
+
+wiz_write_config() {
+	local f="$WIZ_DIR/config.toml" t toml_tags="" list=()
+	read -ra list <<<"$WIZ_TS_TAGS"
+	for t in "${list[@]}"; do toml_tags+="${toml_tags:+, }\"$t\""; done
+	{
+		printf '# Generated by the agos-proxmox.sh guided setup.\n'
+		case $WIZ_ACCESS in
+		tailscale) printf '\n[tailscale]\nenabled = "auto"\ntags = [%s]\n' "$toml_tags" ;;
+		lan) printf '\n[viewer]\nlisten = "0.0.0.0"\n\n[tailscale]\nenabled = "false"\n' ;;
+		ssh) printf '\n[tailscale]\nenabled = "false"\n' ;;
+		esac
+	} >"$f"
+	CONFIG_FILE=$f
+	CONFIG_LABEL="generated by this setup"
+	SECRETS_FILE=$WIZ_SECRETS
+	SECRETS_EXPLICIT=1
+	SECRETS_LABEL="this setup${WIZ_SECRETS_FROM:+ and $WIZ_SECRETS_FROM}"
+}
+
+wiz_summary() {
+	local choice cmds=() summary commands cmd_h cmd_flags=()
+	DRY_RUN=1
+	record_plan
+	DRY_RUN=0
+	cmds=("${PLAN[@]}")
+	PLAN=()
+	wiz_fold < <(plan_summary)
+	summary=$WIZ_FOLDED
+	wt --title "Summary" "${WIZ_BOX_FLAGS[@]}" --ok-button "Next" --msgbox "$summary" "$WIZ_BOX_H" "$WIZ_W" >/dev/null ||
+		wiz_abort
+	wiz_fold < <(
+		printf '%s\n\n' "${cmds[@]}"
+		if ((ISOLATE)); then
+			printf 'Firewall rules for /etc/pve/firewall/%s.fw:\n' "$VMID"
+			firewall_rules | grep -E '^(OUT|IN) '
+		fi
+	)
+	commands=$WIZ_FOLDED cmd_h=$WIZ_BOX_H cmd_flags=("${WIZ_BOX_FLAGS[@]}")
+	while true; do
+		wiz_ask choice --title "Create" --menu "Create VM $VMID '$NAME' now? Nothing has been changed yet." 11 "$WIZ_W" 3 \
+			create "Create the VM" commands "Show the exact commands first" quit "Quit without changing anything"
+		case $choice in
+		create) return 0 ;;
+		commands)
+			wt --title "Commands" "${cmd_flags[@]}" --msgbox "$commands" "$cmd_h" "$WIZ_W" >/dev/null || wiz_abort
+			;;
+		*) wiz_abort ;;
+		esac
+	done
+}
+
+# Read the generated viewer password and agentd token from the guest into
+# shell variables (pipes only, never files or arguments).
+wiz_read_creds() {
+	local res data line
+	WIZ_VIEWER_PW="" WIZ_AGENTD_TOKEN=""
+	res=$(timeout 40 qm guest exec "$VMID" --timeout 15 -- grep -E '^(VIEWER_PASSWORD|AGENTD_TOKEN)=' /etc/agos/secrets.env 2>/dev/null) || true
+	[[ -n $res ]] || return 0
+	data=$(printf '%s' "$res" | guest_out_data 2>/dev/null) || return 0
+	res=""
+	while IFS= read -r line; do
+		case $line in
+		VIEWER_PASSWORD=*) WIZ_VIEWER_PW=${line#*=} ;;
+		AGENTD_TOKEN=*) WIZ_AGENTD_TOKEN=${line#*=} ;;
+		esac
+	done < <(printf '%s\n' "$data")
+	data=""
+}
+
+# The final box, as text: the only place the generated password and token
+# are shown. Built with printf builtins only.
+wiz_final_text() {
+	local ip=${I_IP:-<vm-ip>}
+	printf 'agos VM %s (%s) is ready.\n\n' "$VMID" "$NAME"
+	case $I_ACCESS in
+	tailscale) printf 'Desktop   %s\n' "$I_VIEWER_URL" ;;
+	lan) printf 'Desktop   %s  (self-signed certificate)\n' "$I_VIEWER_URL" ;;
+	*)
+		printf 'Desktop   first: ssh -N -L 8444:127.0.0.1:8444 -L 8765:127.0.0.1:8765 agent@%s\n' "$ip"
+		printf '          then open %s\n' "$I_VIEWER_URL"
+		;;
+	esac
+	printf '          user:     agos\n'
+	printf '          password: %s\n\n' "${WIZ_VIEWER_PW:-(none: reachable only through the tunnel)}"
+	if [[ $I_ACCESS == tailscale ]]; then
+		printf 'agentd    %s\n' "$I_AGENTD_URL"
+	else
+		printf 'agentd    %s  (through the SSH tunnel)\n' "$I_AGENTD_URL"
+	fi
+	printf '          token:    %s\n\n' "${WIZ_AGENTD_TOKEN:-(not found; see below)}"
+	if [[ -s ${WIZ_SSH:-} ]]; then
+		printf 'SSH       ssh agent@%s\n\n' "$ip"
+	else
+		printf 'SSH       no key added; use: qm guest exec %s -- <command>\n\n' "$VMID"
+	fi
+	printf 'Reset to the first-boot state, or delete the VM:\n'
+	printf '  %s reset --vmid %s --yes\n' "$SELF_CMD" "$VMID"
+	printf '  %s destroy --vmid %s --yes\n\n' "$SELF_CMD" "$VMID"
+	printf 'The password and token are shown only here, not in the terminal.\n'
+	printf 'Read them again later with:\n'
+	printf "  qm guest exec %s -- grep -E '^(VIEWER_PASSWORD|AGENTD_TOKEN)=' /etc/agos/secrets.env\n" "$VMID"
+}
+
+wiz_final() {
+	local rc=0
+	wiz_read_creds
+	# fold and the memfd viewer get the text on stdin, never as an argument
+	wiz_fold < <(wiz_final_text)
+	WIZ_VIEWER_PW="" WIZ_AGENTD_TOKEN=""
+	printf '%s\n' "$WIZ_FOLDED" | wiz_textbox_stdin "agos is ready" "$WIZ_BOX_H" "${WIZ_BOX_FLAGS[@]}" || rc=$?
+	WIZ_FOLDED=""
+	# whiptail draws on the alternate screen, so the credentials vanish with
+	# the dialog; terminals without one (TERM=linux) keep it, so wipe it.
+	if ! tput smcup >/dev/null 2>&1; then printf '\e[H\e[2J' >/dev/tty; fi
+	if ((rc == 97)); then
+		wt --title "agos is ready" --msgbox \
+			"VM $VMID ($NAME) is ready. This system cannot show the credentials safely here; read them with:\n\nqm guest exec $VMID -- grep -E '^(VIEWER_PASSWORD|AGENTD_TOKEN)=' /etc/agos/secrets.env" \
+			12 "$WIZ_W" >/dev/null || true
+	fi
+}
+
+cmd_wizard() {
+	local mode text
+	phase "$EX_PREFLIGHT"
+	wiz_dims
+	wiz_banner
+	wiz_preflight
+	local base=$TMP_BASE
+	[[ -d $base && -w $base ]] || base=${TMPDIR:-/tmp}
+	WIZ_DIR=$(mktemp -d -- "$base/agos-wizard.XXXXXX")
+	WIZ_SECRETS="$WIZ_DIR/secrets.env"
+	: >"$WIZ_SECRETS"
+	wiz_defaults
+
+	text="This creates a Proxmox VM running agos $VERSION ($HOST_ARCH): an unattended Debian 13 desktop for AI agents.\n\nNothing changes until you confirm the summary at the end. Press ESC at any time to quit.\n\nCreate a new agos VM?"
+	wiz_yesno --title "agos" --yesno "$text" "$(wiz_hfor "$text" 6)" "$WIZ_W" || wiz_abort
+
+	text="Default: VM '$NAME', $CORES cores, $((MEMORY / 1024)) GiB RAM, ${DISK%G} GiB disk on $WIZ_ST_BEST, bridge $BRIDGE, next free VMID ($WIZ_NEXTID), starts at boot.\n\nAdvanced lets you change all of these."
+	wiz_ask mode --title "Settings" --default-item default --menu "$text" "$(wiz_hfor "$text" 8)" "$WIZ_W" 2 \
+		default "Default settings (recommended)" \
+		advanced "Advanced settings"
+	WIZ_ADVANCED=0
+	if [[ $mode == advanced ]]; then
+		WIZ_ADVANCED=1
+		wiz_advanced
+	else
+		NAME_OPT=$NAME
+	fi
+	wiz_existing_secrets
+	wiz_access
+	wiz_ssh_keys
+	wiz_agent_creds
+	wiz_write_config
+
+	create_preflight
+	check_image_reachable
+	wiz_summary
+	YES=1
+	info "confirmed: creating VM $VMID '$NAME' (image download and first boot take a few minutes)"
+	create_execute
+}
+
 # ------------------------------------------------------------------ main
 
 main() {
@@ -1776,6 +2578,13 @@ main() {
 	for a in "$@"; do
 		if [[ $a == --json ]]; then JSON=1; fi
 	done
+	ARGC=$#
+	# How to run this script again, for the hints it prints.
+	if [[ $0 == *agos-proxmox.sh && -f $0 ]]; then
+		SELF_CMD="bash $(realpath -- "$0" 2>/dev/null || printf '%s' "$0")"
+	else
+		SELF_CMD="bash -c \"\$(curl -fsSL $AGOS_SCRIPT_URL)\" _"
+	fi
 	trap on_exit EXIT
 	trap 'on_err "$LINENO" "$BASH_COMMAND"' ERR
 	trap on_signal INT TERM
@@ -1785,8 +2594,11 @@ main() {
 		exit 0
 	fi
 	validate_settings
+	decide_wizard
 	case $ACTION in
-	create) cmd_create ;;
+	create)
+		if ((WIZ_ACTIVE)); then cmd_wizard; else cmd_create; fi
+		;;
 	status) cmd_status ;;
 	reset) cmd_reset ;;
 	destroy) cmd_destroy ;;

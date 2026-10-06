@@ -26,6 +26,13 @@ case "$*" in
 	[[ $1 == -d ]] && extra=" bridge forward_delay 0 hello_time 200 max_age 2000"
 	printf '5: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT\\    link/ether bc:24:11:00:00:01 brd ff:ff:ff:ff:ff:ff%s\n' "$dev" "$extra"
 	;;
+"-o link show type bridge")
+	n=5
+	for b in $bridges fwbr100i0; do
+		printf '%s: %s: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500 qdisc noqueue state UP mode DEFAULT\\    link/ether bc:24:11:00:00:%02x brd ff:ff:ff:ff:ff:ff\n' "$n" "$b" "$n"
+		n=$((n + 1))
+	done
+	;;
 "-4 route show default dev "*)
 	if [[ $gw4 != none ]]; then printf 'default via %s dev %s proto kernel onlink\n' "$gw4" "$dev"; fi
 	;;

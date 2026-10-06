@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Fake whiptail for the guided-setup tests: replays scripted answers.
+#
+# $FAKE_WT_ANSWERS has one line per dialog, in order: "TYPE RC [VALUE]", e.g.
+#   yesno 0
+#   menu 0 default
+#   passwordbox 0 tskey-client-abc
+#   checklist 0 1 2          (selected tags; printed one per line)
+#   yesno 255                (ESC)
+# TYPE "*" matches any dialog. Each dialog's type and title are appended to
+# $FAKE_WT_LOG (never the answer); the dialog text (or a textbox's content)
+# goes to $FAKE_WT_SCREENS/NN-TYPE.txt so tests can check what was shown.
+set -euo pipefail
+: "${FAKE_WT_ANSWERS:?}" "${FAKE_WT_LOG:?}" "${FAKE_WT_SCREENS:?}"
+outfd=2 type="" title="" text="" boxfile="" items=()
+args=("$@")
+i=0
+while ((i < ${#args[@]})); do
+	a=${args[i]}
+	case $a in
+	--output-fd) outfd=${args[i + 1]} ;;
+	--title) title=${args[i + 1]} ;;
+	--backtitle | --default-item | --yes-button | --no-button | --ok-button | --cancel-button) ;;
+	--yesno | --msgbox | --inputbox | --passwordbox | --menu | --checklist | --radiolist | --infobox)
+		type=${a#--}
+		text=${args[i + 1]}
+		# after the text: height width [list-height items... | default value]
+		items=("${args[@]:i+4}")
+		break
+		;;
+	--textbox)
+		type=textbox
+		boxfile=${args[i + 1]}
+		break
+		;;
+	*)
+		i=$((i + 1))
+		continue
+		;;
+	esac
+	i=$((i + 2))
+done
+counter="$FAKE_WT_LOG.n"
+n=1
+if [[ -f $counter ]]; then n=$(($(cat "$counter") + 1)); fi
+printf '%s' "$n" >"$counter"
+printf '%s\t%s\n' "$type" "$title" >>"$FAKE_WT_LOG"
+# Full argv, so tests can prove no secret is ever passed as an argument.
+printf '%s\n' "$*" >>"$FAKE_WT_LOG.argv"
+mkdir -p "$FAKE_WT_SCREENS"
+{
+	printf '[%s] %s\n' "$type" "$title"
+	if [[ $type == textbox ]]; then cat -- "$boxfile"; else printf '%b\n' "$text"; fi
+	case $type in
+	menu | radiolist | checklist) printf 'items: %s\n' "${items[*]:1}" ;;
+	inputbox) printf 'default: %s\n' "${items[*]:-}" ;;
+	esac
+} >"$FAKE_WT_SCREENS/$(printf '%02d' "$n")-$type.txt"
+line=$(sed -n "${n}p" "$FAKE_WT_ANSWERS")
+if [[ -z $line ]]; then
+	printf 'fake whiptail: no answer for dialog %s (%s "%s")\n' "$n" "$type" "$title" >>"$FAKE_WT_LOG"
+	exit 255
+fi
+want=${line%% *}
+rest=${line#"$want"}
+rest=${rest# }
+rc=${rest%% *}
+value=${rest#"$rc"}
+value=${value# }
+if [[ $want != "*" && $want != "$type" ]]; then
+	printf 'fake whiptail: dialog %s is %s "%s" but the answers file expected %s\n' "$n" "$type" "$title" "$want" >>"$FAKE_WT_LOG"
+	exit 254
+fi
+if [[ -n $value ]]; then
+	if [[ $type == checklist ]]; then value=${value// /$'\n'}; fi
+	printf '%s' "$value" >&"$outfd"
+fi
+exit "$rc"

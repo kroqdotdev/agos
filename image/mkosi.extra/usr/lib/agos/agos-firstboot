@@ -792,8 +792,12 @@ def setup_tailscale(cfg: dict, sec: dict, eff: dict, run: Run) -> dict:
         write_file(keyfile, authkey, 0o600)
         cmd = ["tailscale", "up", "--reset", f"--auth-key=file:{keyfile}", f"--hostname={ts_host}",
                f"--ssh={str(ts['ssh']).lower()}", "--timeout=60s"]
-        if ts["tags"]:
-            cmd.append(f"--advertise-tags={','.join(ts['tags'])}")
+        # Plain auth keys join untagged unless tags were configured: forcing a tag
+        # fails on any tailnet whose ACL does not grant it. OAuth client secrets
+        # can only create tagged nodes, so they get a default tag.
+        tags = ts["tags"] or (["tag:agos"] if key.startswith("tskey-client-") else [])
+        if tags:
+            cmd.append(f"--advertise-tags={','.join(tags)}")
         try:
             res = sh(cmd, timeout=90)
             ok, err = res.returncode == 0, (res.stderr or res.stdout).strip()

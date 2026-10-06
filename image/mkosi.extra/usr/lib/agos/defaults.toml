@@ -22,7 +22,7 @@ listen = "127.0.0.1:8765"
 [tailscale]
 enabled = "auto"                 # auto = on iff TS_AUTHKEY is set (or already joined)
 hostname = ""                    # default: system hostname
-tags = ["tag:agos"]
+tags = []                        # none for auth keys; OAuth client secrets get ["tag:agos"]
 serve = true                     # https://<host>.<tailnet>.ts.net -> viewer, :8765 -> agentd
 ssh = false                      # Tailscale SSH
 

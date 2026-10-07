@@ -126,9 +126,9 @@ and format too, and reports only key names.
 Use the pinned release, never the `main` branch:
 
 ```bash
-curl -fsSL --proto =https --tlsv1.2 -o /root/agos-proxmox.sh https://github.com/kroqdotdev/agos/releases/download/v0.1.0/agos-proxmox.sh
-curl -fsSL --proto =https --tlsv1.2 -o /root/agos-SHA256SUMS https://github.com/kroqdotdev/agos/releases/download/v0.1.0/SHA256SUMS
-curl -fsSL --proto =https --tlsv1.2 -o /root/agos-SHA256SUMS.minisig https://github.com/kroqdotdev/agos/releases/download/v0.1.0/SHA256SUMS.minisig
+curl -fsSL --proto =https --tlsv1.2 -o /root/agos-proxmox.sh https://github.com/kroqdotdev/agos/releases/download/v0.1.1/agos-proxmox.sh
+curl -fsSL --proto =https --tlsv1.2 -o /root/agos-SHA256SUMS https://github.com/kroqdotdev/agos/releases/download/v0.1.1/SHA256SUMS
+curl -fsSL --proto =https --tlsv1.2 -o /root/agos-SHA256SUMS.minisig https://github.com/kroqdotdev/agos/releases/download/v0.1.1/SHA256SUMS.minisig
 cd /root && sha256sum --ignore-missing -c agos-SHA256SUMS
 ```
 

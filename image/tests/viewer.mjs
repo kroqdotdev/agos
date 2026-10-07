@@ -1,9 +1,12 @@
 // Open the agos KasmVNC web client as a human would and screenshot it.
 import { chromium } from 'playwright';
-const [url, user, pass, out] = process.argv.slice(2);
-const browser = await chromium.launch();
+// Optional 5th argument: base64 SHA-256 of the viewer certificate's public key.
+// With it, Chromium trusts exactly that key; without it (throwaway boot-test
+// VMs on loopback) certificate errors are ignored.
+const [url, user, pass, out, spki] = process.argv.slice(2);
+const browser = await chromium.launch(spki ? { args: [`--ignore-certificate-errors-spki-list=${spki}`] } : {});
 const ctx = await browser.newContext({ httpCredentials: { username: user, password: pass },
-                                       ignoreHTTPSErrors: true, viewport: { width: 1400, height: 900 } });
+                                       ignoreHTTPSErrors: !spki, viewport: { width: 1400, height: 900 } });
 const page = await ctx.newPage();
 const ws = [];
 page.on('websocket', w => ws.push(w.url()));

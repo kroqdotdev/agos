@@ -455,7 +455,12 @@ class Check:
             c_back == 200 and c_stale == 409 and code_stale == "STALE_FRAME" and c_ok == 200,
             f"handback {c_back}; next input {c_stale} {code_stale}; after fresh screenshot {c_ok}",
         )
-        self.check("viewer_perm_follows_lease", [p0, p1, p2] == ["view", "control", "view"], [p0, p1, p2])
+        if "without basic auth" in p0:
+            # Loopback viewer without a password (SSH tunnel mode): whoever has the
+            # tunnel already has control, so there is no permission to switch.
+            self.record("viewer_perm_follows_lease", "SKIP", "viewer has no basic auth (SSH tunnel mode)")
+        else:
+            self.check("viewer_perm_follows_lease", [p0, p1, p2] == ["view", "control", "view"], [p0, p1, p2])
         code, audit = self.api("GET", "/v1/audit?limit=200")
         events = [e.get("event") for e in audit.get("entries", [])] if isinstance(audit, dict) else []
         leases = (

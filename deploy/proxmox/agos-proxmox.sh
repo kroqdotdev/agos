@@ -195,7 +195,9 @@ run() {
 		return 0
 	fi
 	log "  + $(quote_cmd "$@")"
-	"$@"
+	# 9>&-: never hand the create lock to children. `qm start` daemonizes the
+	# VM's kvm process, which would otherwise hold the lock for its lifetime.
+	"$@" 9>&-
 }
 
 # ------------------------------------------------------------------ JSON (perl ships with every PVE host)
@@ -1618,7 +1620,10 @@ cmd_create() {
 create_execute() {
 	local lockdir=/run/lock
 	if [[ ! -d $lockdir || ! -w $lockdir ]]; then lockdir=/tmp; fi
-	exec 9>"$lockdir/agos-proxmox.lock"
+	# Not agos-proxmox.lock: 0.1.0 leaked that file's lock into the kvm process
+	# of every VM it started, so on hosts that ran it the old name stays locked
+	# until those VMs restart.
+	exec 9>"$lockdir/agos-proxmox-create.lock"
 	if command -v flock >/dev/null 2>&1 && ! flock -n 9; then
 		die "$EX_PREFLIGHT" "another agos-proxmox.sh run is in progress"
 	fi

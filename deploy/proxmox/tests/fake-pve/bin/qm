@@ -106,6 +106,9 @@ start)
 		echo running >"$QDIR/$1.status"
 	fi
 	rm -f "$QDIR/$1.pings" "$QDIR/$1.reads"
+	# Like the real kvm process, linger with every inherited file descriptor
+	# (a leaked lock would block the next create).
+	sleep 30 >/dev/null 2>&1 &
 	;;
 stop | shutdown)
 	need_local_vm "$1"

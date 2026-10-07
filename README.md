@@ -6,7 +6,7 @@ full X11 desktop to drive, with no human input required at any point. When
 a human does want in, the desktop is one browser tab away over Tailscale,
 with a takeover button that pauses the agent.
 
-> Status: [v0.1.0](https://github.com/kroqdotdev/agos/releases/tag/v0.1.0), first release. Boot-tested in CI on amd64 and arm64; the Proxmox script is tested against a fake Proxmox, not yet a real host.
+> Status: [v0.1.0](https://github.com/kroqdotdev/agos/releases/tag/v0.1.0), first release. Boot-tested in CI on amd64 and arm64, and installed with the guided setup on a real Proxmox VE 9.1 host.
 
 ## What you get
 

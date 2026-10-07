@@ -16,7 +16,8 @@ rm -f "$out"/*.txt
 export PATH="$here/fake-pve/bin:$PATH"
 export FAKE_STATE="$T/state" FAKE_LOG="$T/calls.log" FAKE_ROOT="$T/root" FAKE_HTTP_ROOT="$T/http"
 export AGOS_KVM_DEVICE=/dev/null AGOS_CACHE_DIR="$T/cache" AGOS_POLL_INTERVAL=0.05 AGOS_TMPDIR="$T/run"
-export AGOS_MINISIGN_PUBKEY=none AGOS_IMAGE_FILE="$T/agos-0.1.0-amd64.qcow2"
+V=$(sed -n 's/^AGOS_DEFAULT_VERSION="\([^"]*\)"$/\1/p' "$here/../agos-proxmox.sh")
+export AGOS_MINISIGN_PUBKEY=none AGOS_IMAGE_FILE="$T/agos-$V-amd64.qcow2"
 head -c 300000 /dev/urandom >"$AGOS_IMAGE_FILE"
 : >"$FAKE_LOG"
 mkdir -p /root/.ssh
@@ -73,6 +74,7 @@ capture tailscale-key
 tmux send-keys -t wiz Enter
 step ssh-keys "Public keys that may log in" Enter
 step ssh-paste "Paste one more public key" Enter
+step agents "Agent apps to turn on" Enter
 step claude "Anthropic API key" Enter
 step openai "OpenAI API key for agents" Enter
 step summary "NoCloud ISO (label CIDATA)" Enter
@@ -102,8 +104,8 @@ tmux send-keys -t wiz Enter
 wait_for "Paste a Tailscale key"
 tmux send-keys -t wiz -l "$key"
 tmux send-keys -t wiz Enter
-for text in "Public keys that may log in" "Paste one more public key" "Anthropic API key" "OpenAI API key for agents" \
-	"NoCloud ISO (label CIDATA)"; do
+for text in "Public keys that may log in" "Paste one more public key" "Agent apps to turn on" "Anthropic API key" \
+	"OpenAI API key for agents" "NoCloud ISO (label CIDATA)"; do
 	wait_for "$text"
 	sleep 0.3
 	tmux send-keys -t wiz Enter
@@ -112,11 +114,11 @@ step create "Nothing has been changed yet" Enter
 step ready "agos VM 100 (agos) is ready" Enter
 step finished "[exit 0]"
 tmux kill-server
-check grep -qF "password: SENTINELview42" "$out/15-ready.txt"
-check grep -qF "token:    agd_SENTINELtok42" "$out/15-ready.txt"
-check grep -qF "https://agos.tail1234.ts.net/" "$out/15-ready.txt"
-check grep -qF "agos VM 100 (agos): ready" "$out/16-finished.txt"
-if grep -qE 'SENTINEL' "$out/16-finished.txt"; then
+check grep -qF "password: SENTINELview42" "$out/16-ready.txt"
+check grep -qF "token:    agd_SENTINELtok42" "$out/16-ready.txt"
+check grep -qF "https://agos.tail1234.ts.net/" "$out/16-ready.txt"
+check grep -qF "agos VM 100 (agos): ready" "$out/17-finished.txt"
+if grep -qE 'SENTINEL' "$out/17-finished.txt"; then
 	printf 'render: FAIL: credentials left on the terminal after the final box\n' >&2
 	fails=$((fails + 1))
 fi
@@ -127,11 +129,15 @@ check grep -qF "Tailscale: https://<name>.<tailnet>.ts.net (recommended)" "$out/
 # the passwordbox masks what was typed
 check grep -qF "***" "$out/04-tailscale-key.txt"
 check grep -qF "admin@laptop" "$out/05-ssh-keys.txt"
-check grep -qF "Tailscale (OAuth client secret, tags: tag:agos)" "$out/09-summary.txt"
-check grep -qF "Show the exact commands first" "$out/10-confirm.txt"
-check grep -qF "qm create 100 --name agos" "$out/11-commands.txt"
-check grep -qF "aborted, nothing changed" "$out/13-aborted.txt"
-check grep -qF "Proxmox VE 9.0.10" "$out/13-aborted.txt"
+# both agent apps are ticked by default
+check grep -qE '\[\*\] +claude_code' "$out/07-agents.txt"
+check grep -qE '\[\*\] +t3code' "$out/07-agents.txt"
+check grep -qF "Tailscale (OAuth client secret, tags: tag:agos)" "$out/10-summary.txt"
+check grep -qF "Claude Code, T3 Code" "$out/10-summary.txt"
+check grep -qF "Show the exact commands first" "$out/11-confirm.txt"
+check grep -qF "qm create 100 --name agos" "$out/12-commands.txt"
+check grep -qF "aborted, nothing changed" "$out/14-aborted.txt"
+check grep -qF "Proxmox VE 9.0.10" "$out/14-aborted.txt"
 if grep -lF "$key" "$out"/*.txt "$FAKE_LOG"; then
 	printf 'render: FAIL: the Tailscale key is visible in a capture\n' >&2
 	fails=$((fails + 1))

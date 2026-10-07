@@ -15,8 +15,8 @@
 
 set -Eeuo pipefail
 
-AGOS_SCRIPT_VERSION="0.1.0"
-AGOS_DEFAULT_VERSION="0.1.0"
+AGOS_SCRIPT_VERSION="0.1.1"
+AGOS_DEFAULT_VERSION="0.1.1"
 AGOS_DEFAULT_REPO="kroqdotdev/agos"
 AGOS_SCRIPT_URL="https://kroq.dev/tools/agos-proxmox.sh"
 # Release signing key (the second line of minisign.pub, key id
@@ -71,6 +71,8 @@ Flags (environment variable in brackets):
   --ssh-key-file PATH    public keys for user 'agent' [AGOS_SSH_KEY_FILE]
   --secrets-file PATH    KEY=value secrets, mode 0600 (default: /root/agos.secrets) [AGOS_SECRETS_FILE]
   --config-file PATH     config.toml for /etc/agos/config.toml [AGOS_CONFIG_FILE]
+  --agents LIST          agent apps to turn on: claude-code,t3code (default: both) or none;
+                         adds an [agents] table to the VM's config.toml [AGOS_AGENTS]
   --network-config PATH  cloud-init network-config (default: DHCP) [AGOS_NETWORK_CONFIG]
   --isolate              EXPERIMENTAL: host firewall drops VM traffic to LAN, link-local/
                          metadata, CGNAT, loopback and ULA addresses [AGOS_ISOLATE=1]
@@ -299,6 +301,7 @@ init_settings() {
 	SECRETS_EXPLICIT=0
 	if [[ -n ${AGOS_SECRETS_FILE:-} ]]; then SECRETS_EXPLICIT=1; fi
 	CONFIG_FILE=${AGOS_CONFIG_FILE:-}
+	AGENTS_OPT=${AGOS_AGENTS:-}
 	NETCFG_FILE=${AGOS_NETWORK_CONFIG:-}
 	ISOLATE_DNS=${AGOS_ISOLATE_DNS:-}
 	TIMEOUT=${AGOS_TIMEOUT:-900}
@@ -340,7 +343,7 @@ is_value_flag() {
 	case $1 in
 	--vmid | --name | --storage | --iso-storage | --bridge | --cores | --memory | --disk | --cpu | --onboot | \
 		--version | --image-url | --image-file | --image-sha256 | --ssh-key-file | --secrets-file | \
-		--config-file | --network-config | --isolate-dns | --timeout) return 0 ;;
+		--config-file | --agents | --network-config | --isolate-dns | --timeout) return 0 ;;
 	esac
 	return 1
 }
@@ -367,6 +370,7 @@ set_opt() {
 		SECRETS_EXPLICIT=1
 		;;
 	--config-file) CONFIG_FILE=$2 ;;
+	--agents) AGENTS_OPT=$2 ;;
 	--network-config) NETCFG_FILE=$2 ;;
 	--isolate-dns) ISOLATE_DNS=$2 ;;
 	--timeout) TIMEOUT=$2 ;;
@@ -442,7 +446,54 @@ validate_settings() {
 	for ip in ${ISOLATE_DNS//,/ }; do
 		valid_ip "$ip" || usage_error "--isolate-dns: '$ip' is not an IP address"
 	done
+	parse_agents
 	NAME=${NAME_OPT:-agos}
+}
+
+# --agents LIST -> AGENTS_SET, AGENT_CLAUDE, AGENT_T3 (the [agents] table the
+# seed's config.toml gets; unset = image defaults, which turn both on).
+parse_agents() {
+	local a
+	AGENTS_SET=0 AGENT_CLAUDE=1 AGENT_T3=1
+	[[ -n $AGENTS_OPT ]] || return 0
+	AGENTS_SET=1 AGENT_CLAUDE=0 AGENT_T3=0
+	if [[ $AGENTS_OPT == none ]]; then return 0; fi
+	for a in ${AGENTS_OPT//,/ }; do
+		case $a in
+		claude-code | claude_code) AGENT_CLAUDE=1 ;;
+		t3code | t3-code) AGENT_T3=1 ;;
+		*) usage_error "--agents takes claude-code and/or t3code (comma-separated), or none; got '$a'" ;;
+		esac
+	done
+}
+
+agents_text() {
+	if ((AGENTS_SET == 0)); then
+		if [[ -n $CONFIG_FILE ]] && grep -Eq '^[[:space:]]*\[[[:space:]]*agents[[:space:]]*\]' -- "$CONFIG_FILE"; then
+			printf 'as set in the config file'
+		else
+			printf 'image defaults (Claude Code, T3 Code)'
+		fi
+	elif ((AGENT_CLAUDE && AGENT_T3)); then
+		printf 'Claude Code, T3 Code'
+	elif ((AGENT_CLAUDE)); then
+		printf 'Claude Code (T3 Code off)'
+	elif ((AGENT_T3)); then
+		printf 'T3 Code (Claude Code not pre-seeded)'
+	else
+		printf 'none (T3 Code off, Claude Code not pre-seeded)'
+	fi
+}
+
+# The VM's /etc/agos/config.toml: the --config-file (or the guided setup's)
+# plus the [agents] table from --agents / the "Agent apps" dialog.
+seed_config() {
+	if [[ -n $CONFIG_FILE ]]; then cat -- "$CONFIG_FILE"; fi
+	if ((AGENTS_SET)); then
+		if [[ -n $CONFIG_FILE ]]; then printf '\n'; fi
+		printf '[agents]\nclaude_code = %s\nt3code = %s\n' \
+			"$( ((AGENT_CLAUDE)) && printf true || printf false)" "$( ((AGENT_T3)) && printf true || printf false)"
+	fi
 }
 
 valid_ip() {
@@ -725,6 +776,9 @@ check_config_file() {
 	if command -v python3 >/dev/null 2>&1 && python3 -c 'import tomllib' 2>/dev/null; then
 		python3 -c 'import sys, tomllib; tomllib.load(open(sys.argv[1], "rb"))' "$CONFIG_FILE" 2>/dev/null ||
 			die "$EX_PREFLIGHT" "config file $CONFIG_FILE is not valid TOML"
+	fi
+	if ((AGENTS_SET)) && grep -Eq '^[[:space:]]*\[[[:space:]]*agents[[:space:]]*\]' -- "$CONFIG_FILE"; then
+		die "$EX_USAGE" "$CONFIG_FILE already has an [agents] table; drop --agents (or that table)"
 	fi
 	if grep -Eq 'tskey-|sk-ant-|sk-proj-' -- "$CONFIG_FILE"; then
 		warn "$CONFIG_FILE looks like it contains a secret; config.toml is world-readable in the VM, use --secrets-file"
@@ -1019,17 +1073,17 @@ write_user_data() {
 			printf "      - '%s'\n" "${k//\'/\'\'}"
 		done
 	fi
-	if [[ -z $CONFIG_FILE && -z $SECRETS_FILE ]]; then
+	if [[ -z $CONFIG_FILE && -z $SECRETS_FILE ]] && ((AGENTS_SET == 0)); then
 		return 0
 	fi
 	printf 'write_files:\n'
-	if [[ -n $CONFIG_FILE ]]; then
+	if [[ -n $CONFIG_FILE ]] || ((AGENTS_SET)); then
 		printf '%s\n' "  - path: /etc/agos/config.toml" "    owner: root:root" \
 			"    permissions: \"0644\"" "    encoding: b64"
 		# Quoted, so an empty file is "" rather than YAML null (which
 		# cloud-init's b64 decoder rejects); base64 never contains quotes.
 		printf "    content: '"
-		base64 -w0 -- "$CONFIG_FILE"
+		seed_config | base64 -w0
 		printf "'\n"
 	fi
 	if [[ -n $SECRETS_FILE ]]; then
@@ -1439,6 +1493,11 @@ print_plan() {
 		jf secret_keys "$(json_arr "${SECRET_KEYS[@]}")"
 		jfb tailscale "$HAS_TS"
 		jfs config_file "$CONFIG_FILE"
+		if ((AGENTS_SET)); then
+			jf agents "{\"claude_code\":$( ((AGENT_CLAUDE)) && printf true || printf false),\"t3code\":$( ((AGENT_T3)) && printf true || printf false)}"
+		else
+			jf agents null
+		fi
 		jfs network_config "$NETCFG_FILE"
 		jfn ssh_keys "${#SSH_KEYS[@]}"
 		jfn timeout_s "$TIMEOUT"
@@ -1481,6 +1540,7 @@ plan_summary() {
 		out "             no secrets file"
 	fi
 	out "             config: ${CONFIG_LABEL:-${CONFIG_FILE:-image defaults}}; network: ${NETCFG_FILE:-DHCP}; SSH keys for 'agent': ${#SSH_KEYS[@]}"
+	out "  agents     $(agents_text)"
 	if [[ -n $WIZ_ACCESS ]]; then out "  access     $(wiz_access_text)"; fi
 	if ((ISOLATE && WIZ_ACTIVE)); then
 		out "  isolate    EXPERIMENTAL: drops traffic to LAN, link-local/metadata, CGNAT, loopback and ULA (datacenter firewall: $( ((DC_FIREWALL)) && printf enabled || printf 'DISABLED, not enforced'); rules under 'Show the exact commands')"
@@ -2400,6 +2460,26 @@ wiz_ssh_keys() {
 	if ((n > 0)); then SSH_KEY_FILE=$WIZ_SSH; else SSH_KEY_FILE=""; fi
 }
 
+# Both apps ship in the image; this decides the VM's [agents] table (written
+# by seed_config). --agents preselects the boxes.
+wiz_agent_apps() {
+	local picked="" i claude=ON t3=ON text
+	if ((AGENTS_SET && !AGENT_CLAUDE)); then claude=OFF; fi
+	if ((AGENTS_SET && !AGENT_T3)); then t3=OFF; fi
+	text="Agent apps to turn on in the VM (both come with the image). Space toggles, Enter confirms.\n\nT3 Code opens on workspace 2 of the desktop (agents work on workspace 1). To reach it through T3 Connect, sign in once: in its Settings through the desktop viewer, or with 'agos t3 link' over SSH."
+	wiz_ask picked --title "Agent apps" --separate-output --checklist "$text" \
+		"$(wiz_hfor "$text" 7)" "$WIZ_W" 2 \
+		claude_code "Claude Code: CLI agent, pre-set to never ask questions" "$claude" \
+		t3code "T3 Code: desktop app for coding agents, with T3 Connect" "$t3"
+	AGENTS_SET=1 AGENT_CLAUDE=0 AGENT_T3=0
+	while read -r i; do
+		case $i in
+		claude_code) AGENT_CLAUDE=1 ;;
+		t3code) AGENT_T3=1 ;;
+		esac
+	done < <(printf '%s\n' "$picked")
+}
+
 wiz_agent_creds() {
 	local v="" kind text
 	if ! wiz_has_key ANTHROPIC_API_KEY && ! wiz_has_key CLAUDE_CODE_OAUTH_TOKEN; then
@@ -2448,6 +2528,7 @@ wiz_write_config() {
 		lan) printf '\n[viewer]\nlisten = "0.0.0.0"\n\n[tailscale]\nenabled = "false"\n' ;;
 		ssh) printf '\n[tailscale]\nenabled = "false"\n' ;;
 		esac
+		# [agents] (the "Agent apps" answer) is appended by seed_config
 	} >"$f"
 	CONFIG_FILE=$f
 	CONFIG_LABEL="generated by this setup"
@@ -2532,6 +2613,10 @@ wiz_final_text() {
 	else
 		printf 'SSH       no key added; use: qm guest exec %s -- <command>\n\n' "$VMID"
 	fi
+	if ((AGENT_T3)); then
+		printf 'T3 Code   workspace 2 of the desktop. For T3 Connect sign in once in\n'
+		printf '          its Settings, or run: ssh agent@%s agos t3 link\n\n' "$ip"
+	fi
 	printf 'Reset to the first-boot state, or delete the VM:\n'
 	printf '  %s reset --vmid %s --yes\n' "$SELF_CMD" "$VMID"
 	printf '  %s destroy --vmid %s --yes\n\n' "$SELF_CMD" "$VMID"
@@ -2588,6 +2673,7 @@ cmd_wizard() {
 	wiz_existing_secrets
 	wiz_access
 	wiz_ssh_keys
+	wiz_agent_apps
 	wiz_agent_creds
 	wiz_write_config
 

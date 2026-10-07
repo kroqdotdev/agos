@@ -60,6 +60,7 @@ write_files:
 
       [agents]
       claude_code = true               # Claude Code preinstalled for `agent`
+      t3code = true                    # T3 Code desktop app on workspace 2
 
   # Secrets. KEY=value lines; uncomment and fill in what you use. Leave a line
   # commented out rather than empty.

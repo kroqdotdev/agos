@@ -17,11 +17,11 @@ Release assets (GitHub release `v<version>` of `kroqdotdev/agos`, see
 `agos-<version>-<arch>.raw.xz`, `agos-proxmox.sh`, `SHA256SUMS`,
 `SHA256SUMS.minisig`.
 
-> **Status (v0.1.0): nothing below has been run on real hardware yet.**
-> `agos-proxmox.sh` is tested only against a fake Proxmox (stub `qm`, `pvesm`,
-> `pvesh`, real `genisoimage` and cloud-init schema checks). Every other
-> platform section is written from vendor documentation and is marked
-> *untested*. Please report what works.
+> **Status (v0.1.1):** the Proxmox path (guided setup and flags: create,
+> status, reset, destroy, `--isolate`) is verified on a real Proxmox VE 9.1
+> host, besides the fake-Proxmox test suite. Every other platform section is
+> written from vendor documentation and is marked *untested*. Please report
+> what works.
 
 ## Contents
 
@@ -115,11 +115,15 @@ The dialogs, in order:
 6. **SSH keys** for user `agent`: a checklist of the keys in
    `/root/.ssh/authorized_keys` (type, short fingerprint, comment; all ticked),
    then an optional box to paste one more public key.
-7. Optional **agent credentials**: an Anthropic API key or Claude Code OAuth
+7. **Agent apps**: a checklist of *Claude Code* (pre-seeded so it never asks)
+   and *T3 Code* (desktop app on the VM's second workspace, see
+   [T3 Code](#t3-code)), both ticked; written to the VM's `config.toml` as
+   `[agents] claude_code` / `t3code`. Both are in the image either way.
+8. Optional **agent credentials**: an Anthropic API key or Claude Code OAuth
    token, and an OpenAI API key (blank = skip).
-8. **Summary** (the same plan text as `--dry-run`), then *Create*, *Show the
+9. **Summary** (the same plan text as `--dry-run`), then *Create*, *Show the
    exact commands first*, or *Quit*.
-9. Progress in the terminal, then a final box with the desktop URL, viewer
+10. Progress in the terminal, then a final box with the desktop URL, viewer
    user and password, agentd URL and token, the SSH command and the
    reset/destroy commands. After it closes the terminal shows the same
    summary without the password and token.
@@ -159,7 +163,7 @@ uses):
 
 ```bash
 cd /root
-VER=0.1.0
+VER=0.1.1
 BASE=https://github.com/kroqdotdev/agos/releases/download/v$VER
 curl -fsSLO --proto '=https' --tlsv1.2 "$BASE/agos-proxmox.sh"
 curl -fsSL --proto '=https' --tlsv1.2 -o agos-SHA256SUMS "$BASE/SHA256SUMS"
@@ -255,7 +259,7 @@ with `--isolate`.
 | `--disk SIZE` | `AGOS_DISK` | `64G` | system disk |
 | `--cpu TYPE` | `AGOS_CPU` | `host` | `x86-64-v2-AES` if the VM must live-migrate in a mixed cluster |
 | `--onboot 0\|1` | `AGOS_ONBOOT` | 1 | start the VM when the host boots |
-| `--version VER` | `AGOS_VERSION` | `0.1.0` | release to install |
+| `--version VER` | `AGOS_VERSION` | `0.1.1` | release to install |
 | `--image-url URL` | `AGOS_IMAGE_URL` | GitHub release | https URL; `SHA256SUMS` must sit next to it |
 | `--image-file PATH` | `AGOS_IMAGE_FILE` | | local qcow2, no download |
 | `--image-sha256 HEX` | `AGOS_IMAGE_SHA256` | | expected hash instead of `SHA256SUMS` |
@@ -263,6 +267,7 @@ with `--isolate`.
 | `--ssh-key-file PATH` | `AGOS_SSH_KEY_FILE` | | public keys for `agent` |
 | `--secrets-file PATH` | `AGOS_SECRETS_FILE` | `/root/agos.secrets` | secrets (missing default file = no secrets) |
 | `--config-file PATH` | `AGOS_CONFIG_FILE` | | `config.toml` |
+| `--agents LIST` | `AGOS_AGENTS` | image defaults (both) | `claude-code,t3code`, one of them, or `none`: appends an `[agents]` table to the VM's `config.toml` (an error if `--config-file` already has one) |
 | `--network-config PATH` | `AGOS_NETWORK_CONFIG` | DHCP | cloud-init network-config |
 | `--isolate` | `AGOS_ISOLATE=1` | | experimental egress filter, see below |
 | `--isolate-dns IP[,IP]` | `AGOS_ISOLATE_DNS` | | extra resolvers the isolated VM may use |
@@ -355,7 +360,7 @@ AAVMF (`qemu-efi-aarch64`).
 virt-install builds and attaches its own NoCloud ISO for the first boot:
 
 ```bash
-sudo cp agos-0.1.0-amd64.qcow2 /var/lib/libvirt/images/agos.qcow2
+sudo cp agos-0.1.1-amd64.qcow2 /var/lib/libvirt/images/agos.qcow2
 sudo qemu-img resize /var/lib/libvirt/images/agos.qcow2 64G
 virt-install --name agos --memory 8192 --vcpus 4 --cpu host-passthrough \
   --osinfo detect=on,require=off \
@@ -400,14 +405,14 @@ cat > metadata.yaml <<EOF
 architecture: x86_64          # aarch64 for the arm64 image
 creation_date: $(date +%s)
 properties:
-  description: agos 0.1.0
+  description: agos 0.1.1
   os: debian
   release: trixie
 EOF
 tar -cJf agos-metadata.tar.xz metadata.yaml
-incus image import agos-metadata.tar.xz agos-0.1.0-amd64.qcow2 --alias agos-0.1.0
+incus image import agos-metadata.tar.xz agos-0.1.1-amd64.qcow2 --alias agos-0.1.1
 
-incus init agos-0.1.0 agos --vm -c limits.cpu=4 -c limits.memory=8GiB \
+incus init agos-0.1.1 agos --vm -c limits.cpu=4 -c limits.memory=8GiB \
   -c security.secureboot=false -d root,size=64GiB
 incus config set agos cloud-init.user-data "$(cat user-data)"
 incus config device add agos cloud-init disk source=cloud-init:config
@@ -430,7 +435,7 @@ Virtualization does not take qcow2). Build the seed on the Mac with
 1. Create a New Virtual Machine → Virtualize → Other → skip the ISO.
 2. Hardware: 8 GiB RAM, 4 cores. Storage: any size (you delete it next).
 3. Before first start, edit the VM: Drives → delete the new drive → New
-   Drive → Import → `agos-0.1.0-arm64.qcow2` (interface VirtIO); resize it if
+   Drive → Import → `agos-0.1.1-arm64.qcow2` (interface VirtIO); resize it if
    you like. New Drive → Removable, interface USB or VirtIO → select
    `seed.iso`.
 4. Display: `virtio-gpu-gl-pci` or `virtio-ramfb`. Network: Shared Network.
@@ -443,7 +448,7 @@ Virtualization does not take qcow2). Build the seed on the Mac with
 *Untested.* amd64 only.
 
 ```bash
-qemu-img convert -p -O vdi agos-0.1.0-amd64.qcow2 agos.vdi
+qemu-img convert -p -O vdi agos-0.1.1-amd64.qcow2 agos.vdi
 VBoxManage modifymedium disk agos.vdi --resize 65536
 VBoxManage createvm --name agos --ostype Debian_64 --register
 VBoxManage modifyvm agos --firmware efi --memory 8192 --cpus 4 \
@@ -466,7 +471,7 @@ the seed as a DVD (Gen2 VMs take ISOs on their SCSI DVD drive).
 
 ```bash
 # on Linux or WSL
-qemu-img convert -p -O vhdx -o subformat=dynamic agos-0.1.0-amd64.qcow2 agos.vhdx
+qemu-img convert -p -O vhdx -o subformat=dynamic agos-0.1.1-amd64.qcow2 agos.vhdx
 ```
 
 ```powershell
@@ -527,6 +532,37 @@ qm guest exec <vmid> -- grep -E '^(VIEWER_PASSWORD|AGENTD_TOKEN)=' /etc/agos/sec
 # anywhere you have SSH
 ssh agent@<vm-ip> sudo grep -E '^(VIEWER_PASSWORD|AGENTD_TOKEN)=' /etc/agos/secrets.env
 ```
+
+### T3 Code
+
+[T3 Code](https://github.com/pingdotgg/t3code) (desktop app for coding
+agents) runs on the desktop's **second workspace**, so agents working on
+workspace 1 never see it. In the viewer, click the second box of the
+workspace switcher in the top panel (it shows T3 Code's icon), and the first
+box to go back. It drives the VM's Claude Code (signed in through
+`ANTHROPIC_API_KEY` / `CLAUDE_CODE_OAUTH_TOKEN`, or `claude auth login`);
+other provider CLIs (Codex, ...) are not preinstalled.
+
+**T3 Connect** (reach the VM's T3 Code from the T3 mobile app or another
+machine, no port forwarding) needs one sign-in by a human; nothing can do it
+unattended. In the viewer on workspace 2: Settings (gear, bottom left) →
+*Connections* → *Sign in to T3 Connect* (Apple, GitHub, Google, Microsoft or
+an e-mail code), then switch on *T3 Connect*. T3 Code keeps the link in the
+VM (`~/.t3/userdata`), so it should survive reboots (not verified end to end
+here, there was no T3 account), but not `agos-proxmox.sh reset`, which rolls
+back to the first-boot snapshot: sign in again after a reset. Without
+the GUI: `ssh agent@<vm>` and run
+`ELECTRON_RUN_AS_NODE=1 /opt/t3code/t3code /opt/t3code/resources/app.asar/apps/server/dist/bin.mjs connect link --headless`,
+approve the printed code on any device, then
+`systemctl --user restart agos-t3code`.
+
+If the VM is on Tailscale with `serve` on, leave T3 Code's own *Tailscale
+HTTPS* switch off or give it another port: agos already serves the desktop
+on 443.
+
+Turn it off with `[agents] t3code = false` (or untick it in the guided
+setup, or `--agents claude-code`); on a running VM edit
+`/etc/agos/config.toml` and run `sudo agos apply`.
 
 ## Security notes
 

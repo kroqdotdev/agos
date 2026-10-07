@@ -6,6 +6,9 @@ set -uo pipefail
 HERE=$(cd -- "$(dirname -- "$0")" && pwd)
 REPO=$(cd -- "$HERE/../../.." && pwd)
 SCRIPT="$REPO/deploy/proxmox/agos-proxmox.sh"
+# The release the script installs by default; VR is the same as a regex.
+V=$(sed -n 's/^AGOS_DEFAULT_VERSION="\([^"]*\)"$/\1/p' "$SCRIPT")
+VR=${V//./\\.}
 export PATH="$HERE/fake-pve/bin:$PATH"
 
 PASS=0
@@ -43,11 +46,11 @@ setup() {
 	printf '%s\n' '# test secrets' 'TS_AUTHKEY=tskey-client-SENTINELts111' \
 		'ANTHROPIC_API_KEY=sk-ant-SENTINELak222' 'VIEWER_PASSWORD=SENTINELpw333' >"$T/agos.secrets"
 	chmod 600 "$T/agos.secrets"
-	head -c 300000 /dev/urandom >"$T/agos-0.1.0-amd64.qcow2"
-	head -c 300000 /dev/urandom >"$T/agos-0.1.0-arm64.qcow2"
-	(cd "$T" && sha256sum agos-0.1.0-amd64.qcow2 agos-0.1.0-arm64.qcow2 >SHA256SUMS)
+	head -c 300000 /dev/urandom >"$T/agos-$V-amd64.qcow2"
+	head -c 300000 /dev/urandom >"$T/agos-$V-arm64.qcow2"
+	(cd "$T" && sha256sum "agos-$V-amd64.qcow2" "agos-$V-arm64.qcow2" >SHA256SUMS)
 	printf '%s\n' 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFakeKeyForTheTestSuiteOnly0000000000000 tester@example' >"$T/id.pub"
-	IMG="$T/agos-0.1.0-amd64.qcow2"
+	IMG="$T/agos-$V-amd64.qcow2"
 }
 
 finish() {
@@ -250,6 +253,7 @@ t_dry_run_json() {
 	expect_json iso_storage local
 	expect_json tailscale true
 	expect_json secret_keys '["ANTHROPIC_API_KEY","TS_AUTHKEY","VIEWER_PASSWORD"]'
+	expect_json agents null
 	local cmds
 	cmds=$(jget commands)
 	[[ $cmds == *'--cpu x86-64-v2-AES --cores 2 --memory 4096'* ]] || fail "plan lacks the hardware flags"
@@ -261,17 +265,17 @@ t_dry_run_json() {
 
 t_dry_run_download_checks() {
 	setup dry_run_download_checks
-	local rel="$FAKE_HTTP_ROOT/github.com/kroqdotdev/agos/releases/download/v0.1.0"
+	local rel="$FAKE_HTTP_ROOT/github.com/kroqdotdev/agos/releases/download/v$V"
 	agos --dry-run --json
 	expect_rc 3
-	expect_json error 'not reachable: https://github.com/kroqdotdev/agos/releases/download/v0.1.0/agos-0.1.0-amd64.qcow2'
+	expect_json error "not reachable: https://github.com/kroqdotdev/agos/releases/download/v$V/agos-$V-amd64.qcow2"
 	mkdir -p "$rel"
 	cp "$IMG" "$T/SHA256SUMS" "$rel/"
 	agos --dry-run --json
 	expect_rc 0
-	expect_json image_url 'https://github.com/kroqdotdev/agos/releases/download/v0.1.0/agos-0.1.0-amd64.qcow2'
-	expect_called '^curl -fsSL --proto =https --tlsv1.2 --connect-timeout 20 -r 0-0 -o /dev/null https://github.com/kroqdotdev/agos/releases/download/v0.1.0/agos-0.1.0-amd64.qcow2$'
-	expect_no_file "$T/cache/0.1.0/agos-0.1.0-amd64.qcow2"
+	expect_json image_url "https://github.com/kroqdotdev/agos/releases/download/v$V/agos-$V-amd64.qcow2"
+	expect_called "^curl -fsSL --proto =https --tlsv1.2 --connect-timeout 20 -r 0-0 -o /dev/null https://github.com/kroqdotdev/agos/releases/download/v$V/agos-$V-amd64.qcow2\$"
+	expect_no_file "$T/cache/$V/agos-$V-amd64.qcow2"
 	finish
 }
 
@@ -372,7 +376,7 @@ t_create_idempotent() {
 
 t_create_arm64() {
 	setup create_arm64
-	FAKE_ARCH=arm64 agos --yes --json --image-file "$T/agos-0.1.0-arm64.qcow2" --secrets-file "$T/agos.secrets"
+	FAKE_ARCH=arm64 agos --yes --json --image-file "$T/agos-$V-arm64.qcow2" --secrets-file "$T/agos.secrets"
 	expect_rc 0
 	expect_json state ready
 	expect_called '^qm create 100 .*--cpu host'
@@ -381,7 +385,7 @@ t_create_arm64() {
 	expect_called '^qm set 100 --scsi1 local:iso/agos-seed-100.iso,media=cdrom$'
 	expect_called '^qm set 100 --scsi1 none,media=cdrom$'
 	expect_not_called '--ide2'
-	FAKE_ARCH=arm64 agos --dry-run --image-file "$T/agos-0.1.0-arm64.qcow2" --name other --cpu x86-64-v2-AES
+	FAKE_ARCH=arm64 agos --dry-run --image-file "$T/agos-$V-arm64.qcow2" --name other --cpu x86-64-v2-AES
 	expect_rc 1
 	expect_err 'x86 model'
 	finish
@@ -420,6 +424,45 @@ assert "/etc/agos/secrets.env" not in {f["path"] for f in ud["write_files"]}
 EOF
 	cloud-init schema -t network-config -c "$REPO/deploy/cloud-init/network-config.static" >/dev/null 2>&1 ||
 		fail "cloud-init rejects network-config.static"
+	finish
+}
+
+t_agents_flag() {
+	setup agents_flag
+	agos --dry-run --json --image-file "$IMG" --agents t3code
+	expect_rc 0
+	expect_json agents t3code true
+	expect_json agents claude_code false
+	agos --dry-run --image-file "$IMG" --agents claude-code,t3code
+	expect_rc 0
+	expect_out 'agents     Claude Code, T3 Code'
+	agos --dry-run --image-file "$IMG"
+	expect_rc 0
+	expect_out 'agents     image defaults \(Claude Code, T3 Code\)'
+	agos --agents bogus
+	expect_rc 1
+	expect_err 'agents takes claude-code and/or t3code'
+	# a config file that has its own [agents] table and --agents contradict each other
+	printf '[agents]\nt3code = false\n' >"$T/agents.toml"
+	agos --dry-run --image-file "$IMG" --config-file "$T/agents.toml" --agents t3code
+	expect_rc 1
+	expect_err 'already has an \[agents\] table'
+	agos --dry-run --image-file "$IMG" --config-file "$T/agents.toml"
+	expect_rc 0
+	expect_out 'agents     as set in the config file'
+	# without a config file the seed's config.toml is just the [agents] table
+	agos --yes --image-file "$IMG" --agents none
+	expect_rc 0
+	seed_written 100 /etc/agos/config.toml >"$T/cfg100"
+	python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); assert c == {"agents": {"claude_code": False, "t3code": False}}, c' \
+		"$T/cfg100" || fail "--agents none must seed claude_code = false, t3code = false"
+	# with one it is appended and the file's own settings stay
+	FAKE_LAN=1 AGOS_AGENTS=claude-code agos --yes --image-file "$IMG" --vmid 101 --name agos2 \
+		--config-file "$HERE/fixtures/config-lan.toml"
+	expect_rc 0
+	seed_written 101 /etc/agos/config.toml >"$T/cfg101"
+	python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); assert c["agents"] == {"claude_code": True, "t3code": False} and c["viewer"]["listen"] == "0.0.0.0", c' \
+		"$T/cfg101" || fail "AGOS_AGENTS with --config-file must append [agents] and keep the file"
 	finish
 }
 
@@ -697,29 +740,29 @@ t_isolate() {
 
 t_download_and_verify() {
 	setup download_and_verify
-	local rel="$FAKE_HTTP_ROOT/github.com/kroqdotdev/agos/releases/download/v0.1.0"
+	local rel="$FAKE_HTTP_ROOT/github.com/kroqdotdev/agos/releases/download/v$V"
 	mkdir -p "$rel"
 	cp "$IMG" "$T/SHA256SUMS" "$rel/"
 	agos --yes --json
 	expect_rc 0
 	expect_json image_checksum ok
 	expect_json image_signature 'unverified (no public key)'
-	expect_called '^curl .*--proto =https --tlsv1.2 .*https://github.com/kroqdotdev/agos/releases/download/v0.1.0/SHA256SUMS$'
-	expect_file "$T/cache/0.1.0/agos-0.1.0-amd64.qcow2"
-	expect_called "import-from=$T/cache/0.1.0/agos-0.1.0-amd64.qcow2"
+	expect_called "^curl .*--proto =https --tlsv1.2 .*https://github.com/kroqdotdev/agos/releases/download/v$V/SHA256SUMS\$"
+	expect_file "$T/cache/$V/agos-$V-amd64.qcow2"
+	expect_called "import-from=$T/cache/$V/agos-$V-amd64.qcow2"
 	# cached and verified: no second image download
 	: >"$FAKE_LOG"
 	agos --yes --json --name second
 	expect_rc 0
-	expect_not_called 'curl .*agos-0.1.0-amd64.qcow2'
+	expect_not_called "curl .*agos-$V-amd64.qcow2"
 	expect_err 'using cached'
 	# tampered release: checksum mismatch -> 3, VM not created
-	head -c 1000 /dev/urandom >"$rel/agos-0.1.0-amd64.qcow2"
-	rm -f "$T/cache/0.1.0/agos-0.1.0-amd64.qcow2"
+	head -c 1000 /dev/urandom >"$rel/agos-$V-amd64.qcow2"
+	rm -f "$T/cache/$V/agos-$V-amd64.qcow2"
 	agos --yes --json --name third
 	expect_rc 3
-	expect_json error 'SHA-256 mismatch for agos-0.1.0-amd64.qcow2 (download removed)'
-	expect_no_file "$T/cache/0.1.0/agos-0.1.0-amd64.qcow2"
+	expect_json error "SHA-256 mismatch for agos-$V-amd64.qcow2 (download removed)"
+	expect_no_file "$T/cache/$V/agos-$V-amd64.qcow2"
 	[[ $(vm_count) == 2 ]] || fail "a VM was created from a bad image"
 	# missing release -> 3
 	agos --yes --version 9.9.9 --name fourth
@@ -729,7 +772,7 @@ t_download_and_verify() {
 
 t_signature() {
 	setup signature
-	local rel="$FAKE_HTTP_ROOT/github.com/kroqdotdev/agos/releases/download/v0.1.0" pub v
+	local rel="$FAKE_HTTP_ROOT/github.com/kroqdotdev/agos/releases/download/v$V" pub v
 	mkdir -p "$rel"
 	cp "$IMG" "$T/SHA256SUMS" "$rel/"
 	# no key + --require-signature fails closed
@@ -740,7 +783,7 @@ t_signature() {
 	unset AGOS_MINISIGN_PUBKEY
 	agos --yes --json --name nosig
 	expect_rc 3
-	expect_err 'cannot download https://.*/v0\.1\.0/SHA256SUMS\.minisig \(unsigned fork'
+	expect_err "cannot download https://.*/v$VR/SHA256SUMS\\.minisig \\(unsigned fork"
 	minisign -G -W -p "$T/minisign.pub" -s "$T/minisign.key" >/dev/null 2>&1 || fail "minisign -G failed"
 	pub=$(tail -n1 "$T/minisign.pub")
 	minisign -S -s "$T/minisign.key" -m "$rel/SHA256SUMS" -x "$rel/SHA256SUMS.minisig" >/dev/null 2>&1 </dev/null ||
@@ -980,18 +1023,21 @@ wiz_no_leaks() {
 t_wizard_default_tailscale() {
 	wiz_setup wizard_default_tailscale
 	answers "yesno 0" "menu 0 default" "menu 0 tailscale" "passwordbox 0 tskey-client-SENTINELwts1-abc" \
-		"checklist 0 1 2" "inputbox 0" "passwordbox 0 sk-ant-api03-SENTINELwak2" "passwordbox 0" \
-		"msgbox 0" "menu 0 create" "textbox 0"
+		"checklist 0 1 2" "inputbox 0" "checklist 0 claude_code t3code" "passwordbox 0 sk-ant-api03-SENTINELwak2" \
+		"passwordbox 0" "msgbox 0" "menu 0 create" "textbox 0"
 	FAKE_TAILSCALE=1 wizard
 	expect_rc 0
-	expect_dialogs yesno menu menu passwordbox checklist inputbox passwordbox passwordbox msgbox menu textbox
-	expect_term 'agos 0\.1\.0 - an unattended desktop'
+	expect_dialogs yesno menu menu passwordbox checklist inputbox checklist passwordbox passwordbox msgbox menu textbox
+	expect_term "agos $VR - an unattended desktop"
 	expect_term '✓.* Proxmox VE 9\.0\.10'
 	expect_term '✓.* KVM available'
 	expect_term 'agos VM 100 \(agos\): ready'
 	expect_called '^qm create 100 --name agos --tags agos .*--onboot 1 '
 	expect_called '^qm snapshot 100 golden'
-	seed_written 100 /etc/agos/config.toml | grep -q '^tags = \["tag:agos"\]$' || fail "config.toml lacks tags = [\"tag:agos\"]"
+	seed_written 100 /etc/agos/config.toml >"$T/cfg"
+	grep -q '^tags = \["tag:agos"\]$' "$T/cfg" || fail "config.toml lacks tags = [\"tag:agos\"]"
+	python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); assert c["agents"] == {"claude_code": True, "t3code": True}, c' \
+		"$T/cfg" || fail "config.toml lacks [agents] claude_code = true, t3code = true"
 	seed_written 100 /etc/agos/secrets.env >"$T/sec"
 	grep -qx 'TS_AUTHKEY=tskey-client-SENTINELwts1-abc' "$T/sec" || fail "TS_AUTHKEY not in the seed"
 	grep -qx 'ANTHROPIC_API_KEY=sk-ant-api03-SENTINELwak2' "$T/sec" || fail "ANTHROPIC_API_KEY not in the seed"
@@ -999,14 +1045,17 @@ t_wizard_default_tailscale() {
 	[[ $(grep -c . "$T/keys") == 2 ]] || fail "expected the 2 distinct authorized_keys entries in the seed"
 	grep -qx 'ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQFakeRsaKeyForTests00000000 root@pve' "$T/keys" || fail "key options were not stripped"
 	expect_screen 05 'items: 1 ssh-ed25519 SHA256:[A-Za-z0-9+/]{10} admin@laptop ON 2 ssh-rsa SHA256:'
-	expect_screen 09 'access     Tailscale \(OAuth client secret, tags: tag:agos\)'
-	expect_screen 09 'secrets from this setup: ANTHROPIC_API_KEY TS_AUTHKEY'
-	expect_screen 09 "VM         100 'agos' \(tag agos, starts at boot\)"
-	expect_screen 11 'Desktop https://agos\.tail1234\.ts\.net/'
-	expect_screen 11 'user: agos password: SENTINELview42'
-	expect_screen 11 'agentd https://agos\.tail1234\.ts\.net:8765/ token: agd_SENTINELtok42'
-	expect_screen 11 'bash .*agos-proxmox\.sh reset --vmid 100 --yes'
-	expect_screen 11 'bash .*agos-proxmox\.sh destroy --vmid 100 --yes'
+	expect_screen 07 'items: claude_code Claude Code: .* ON t3code T3 Code: .* ON'
+	expect_screen 07 'T3 Code opens on workspace 2'
+	expect_screen 10 'access     Tailscale \(OAuth client secret, tags: tag:agos\)'
+	expect_screen 10 'secrets from this setup: ANTHROPIC_API_KEY TS_AUTHKEY'
+	expect_screen 10 "VM         100 'agos' \(tag agos, starts at boot\)"
+	expect_screen 10 'agents     Claude Code, T3 Code'
+	expect_screen 12 'Desktop https://agos\.tail1234\.ts\.net/'
+	expect_screen 12 'user: agos password: SENTINELview42'
+	expect_screen 12 'agentd https://agos\.tail1234\.ts\.net:8765/ token: agd_SENTINELtok42'
+	expect_screen 12 'bash .*agos-proxmox\.sh reset --vmid 100 --yes'
+	expect_screen 12 'bash .*agos-proxmox\.sh destroy --vmid 100 --yes'
 	grep -q -- '--textbox /dev/fd/' "$FAKE_WT_LOG.argv" || fail "the final dialog was not fed through /dev/fd"
 	seed_file 100 user-data >"$T/ud.yaml"
 	cloud-init schema -c "$T/ud.yaml" >"$T/schema.log" 2>&1 || fail "cloud-init rejects the wizard's user-data: $(tail -n2 "$T/schema.log")"
@@ -1017,14 +1066,14 @@ t_wizard_default_tailscale() {
 t_wizard_auth_key() {
 	wiz_setup wizard_auth_key
 	answers "yesno 0" "menu 0 default" "menu 0 tailscale" "passwordbox 0 not-a-key" "msgbox 0" \
-		"passwordbox 0 tskey-auth-SENTINELwau1-x" "checklist 0 1" "inputbox 0" "passwordbox 0" "passwordbox 0" \
-		"msgbox 0" "menu 0 create" "textbox 0"
+		"passwordbox 0 tskey-auth-SENTINELwau1-x" "checklist 0 1" "inputbox 0" "checklist 0 claude_code t3code" \
+		"passwordbox 0" "passwordbox 0" "msgbox 0" "menu 0 create" "textbox 0"
 	wizard
 	expect_rc 0
 	expect_screen 05 'must start with tskey-'
 	seed_written 100 /etc/agos/config.toml | grep -q '^tags = \[\]$' || fail "auth keys must get tags = []"
 	seed_written 100 /etc/agos/secrets.env | grep -qx 'TS_AUTHKEY=tskey-auth-SENTINELwau1-x' || fail "TS_AUTHKEY not in the seed"
-	expect_screen 11 'Tailscale \(auth key, tags: none\)'
+	expect_screen 12 'Tailscale \(auth key, tags: none\)'
 	wiz_no_leaks
 	finish
 }
@@ -1032,16 +1081,19 @@ t_wizard_auth_key() {
 t_wizard_lan() {
 	wiz_setup wizard_lan
 	answers "yesno 0" "menu 0 default" "menu 0 lan" "passwordbox 0 short" "msgbox 0" \
-		"passwordbox 0 SENTINELlanpw-123" "checklist 0 1" "inputbox 0" "passwordbox 0" "passwordbox 0" \
-		"msgbox 0" "menu 0 create" "textbox 0"
+		"passwordbox 0 SENTINELlanpw-123" "checklist 0 1" "inputbox 0" "checklist 0 claude_code" "passwordbox 0" \
+		"passwordbox 0" "msgbox 0" "menu 0 create" "textbox 0"
 	FAKE_LAN=1 wizard
 	expect_rc 0
 	seed_written 100 /etc/agos/config.toml >"$T/cfg"
 	grep -q '^listen = "0.0.0.0"$' "$T/cfg" || fail "LAN mode not in config.toml"
 	grep -q '^enabled = "false"$' "$T/cfg" || fail "Tailscale should be off in LAN mode"
+	python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); assert c["agents"] == {"claude_code": True, "t3code": False}, c' \
+		"$T/cfg" || fail "unticking T3 Code must write t3code = false"
 	seed_written 100 /etc/agos/secrets.env | grep -qx 'VIEWER_PASSWORD=SENTINELlanpw-123' || fail "VIEWER_PASSWORD not in the seed"
-	expect_screen 11 'LAN: https://<vm-ip>:8444, user agos, password set'
-	expect_screen 13 'Desktop https://192\.168\.1\.57:8444/ \(self-signed certificate\)'
+	expect_screen 12 'LAN: https://<vm-ip>:8444, user agos, password set'
+	expect_screen 12 'agents     Claude Code \(T3 Code off\)'
+	expect_screen 14 'Desktop https://192\.168\.1\.57:8444/ \(self-signed certificate\)'
 	wiz_no_leaks
 	finish
 }
@@ -1053,14 +1105,18 @@ t_wizard_advanced() {
 	answers "yesno 0" "menu 0 advanced" "inputbox 0 abc" "msgbox 0" "inputbox 0 150" "inputbox 0 bad_name" "msgbox 0" \
 		"inputbox 0 box1" "menu 0 big" "menu 0 vmbr1" "inputbox 0 2" "inputbox 0 4096" "inputbox 0 32" \
 		"menu 0 x86-64-v2-AES" "yesno 1" "yesno 0" "yesno 0" "menu 0 ssh" "checklist 0" "inputbox 0" "yesno 0" \
-		"passwordbox 0" "passwordbox 0" "msgbox 0" "menu 0 commands" "msgbox 0" "menu 0 create" "textbox 0"
+		"checklist 0" "passwordbox 0" "passwordbox 0" "msgbox 0" "menu 0 commands" "msgbox 0" "menu 0 create" \
+		"textbox 0"
 	wizard
 	expect_rc 0
 	expect_called '^qm create 150 --name box1 --tags agos .*--cpu x86-64-v2-AES --cores 2 --memory 4096 .*--net0 virtio,bridge=vmbr1,firewall=1 .*--onboot 0 '
 	expect_called '^qm set 150 --efidisk0 big:1,efitype=4m,pre-enrolled-keys=0$'
 	expect_called '^qm resize 150 scsi0 32G$'
 	expect_file /etc/pve/firewall/150.fw
-	seed_written 150 /etc/agos/config.toml | grep -q '^enabled = "false"$' || fail "SSH-only access should turn Tailscale off"
+	seed_written 150 /etc/agos/config.toml >"$T/cfg"
+	grep -q '^enabled = "false"$' "$T/cfg" || fail "SSH-only access should turn Tailscale off"
+	python3 -c 'import sys, tomllib; c = tomllib.load(open(sys.argv[1], "rb")); assert c["agents"] == {"claude_code": False, "t3code": False}, c' \
+		"$T/cfg" || fail "no agent app ticked must write both as false"
 	[[ -z $(seed_ssh_keys 150) ]] || fail "no SSH key was selected"
 	expect_screen 03 'default: 100'
 	expect_screen 09 'items: local-lvm lvmthin, [0-9]+ GiB free big zfspool, [0-9]+ GiB free'
@@ -1068,11 +1124,12 @@ t_wizard_advanced() {
 	if screen 10 | grep -q fwbr; then fail "firewall bridges must not be offered"; fi
 	expect_screen 17 'datacenter firewall is DISABLED'
 	expect_screen 21 'Continue without an SSH key'
-	expect_screen 24 "VM         150 'box1' \(tag agos, not started at boot\)"
-	expect_screen 26 'qm create 150 --name box1'
-	expect_screen 28 'SSH no key added'
-	expect_screen 26 'Firewall rules for /etc/pve/firewall/150\.fw: OUT ACCEPT'
-	expect_screen 24 'isolate EXPERIMENTAL: drops traffic to LAN'
+	expect_screen 25 "VM         150 'box1' \(tag agos, not started at boot\)"
+	expect_screen 25 'agents     none \(T3 Code off, Claude Code not pre-seeded\)'
+	expect_screen 27 'qm create 150 --name box1'
+	expect_screen 29 'SSH no key added'
+	expect_screen 27 'Firewall rules for /etc/pve/firewall/150\.fw: OUT ACCEPT'
+	expect_screen 25 'isolate EXPERIMENTAL: drops traffic to LAN'
 	# no secrets at all: secrets.env must be an empty string, not YAML null
 	seed_file 150 user-data >"$T/ud.yaml"
 	cloud-init schema -c "$T/ud.yaml" >"$T/schema.log" 2>&1 || fail "cloud-init rejects user-data without secrets: $(tail -n2 "$T/schema.log")"
@@ -1087,7 +1144,7 @@ t_wizard_advanced_tailscale_tags() {
 		"inputbox 0 4" "inputbox 0 8192" "inputbox 0 64" "menu 0 host" "yesno 0" "yesno 1" \
 		"menu 0 tailscale" "passwordbox 0 tskey-client-SENTINELtag1-y" "inputbox 0 tag:bad!" "msgbox 0" \
 		"inputbox 0" "msgbox 0" "inputbox 0 tag:agos,tag:lab" "checklist 0 1" "inputbox 0" \
-		"passwordbox 0 foo bar" "msgbox 0" "passwordbox 0 sk-ant-oat01-SENTINELoat1" \
+		"checklist 0 claude_code t3code" "passwordbox 0 foo bar" "msgbox 0" "passwordbox 0 sk-ant-oat01-SENTINELoat1" \
 		"passwordbox 0 sk-proj-SENTINELoai1" "msgbox 0" "menu 0 create" "textbox 0"
 	wizard
 	expect_rc 0
@@ -1109,13 +1166,13 @@ t_wizard_existing_secrets() {
 	chmod 600 /root/agos.secrets
 	cp /root/agos.secrets "$T/secrets.before"
 	answers "yesno 0" "menu 0 default" "yesno 0" "menu 0 tailscale" "msgbox 0" "checklist 0 1 2" "inputbox 0" \
-		"passwordbox 0" "msgbox 0" "menu 0 create" "textbox 0"
+		"checklist 0 claude_code t3code" "passwordbox 0" "msgbox 0" "menu 0 create" "textbox 0"
 	wizard
 	expect_rc 0
-	expect_dialogs yesno menu yesno menu msgbox checklist inputbox passwordbox msgbox menu textbox
+	expect_dialogs yesno menu yesno menu msgbox checklist inputbox checklist passwordbox msgbox menu textbox
 	expect_screen 03 'ANTHROPIC_API_KEY TS_AUTHKEY'
 	expect_screen 05 'Using TS_AUTHKEY from /root/agos.secrets'
-	expect_screen 09 'secrets from this setup and /root/agos.secrets: ANTHROPIC_API_KEY TS_AUTHKEY'
+	expect_screen 10 'secrets from this setup and /root/agos.secrets: ANTHROPIC_API_KEY TS_AUTHKEY'
 	seed_written 100 /etc/agos/secrets.env >"$T/sec"
 	grep -qx 'TS_AUTHKEY=tskey-auth-SENTINELexist1' "$T/sec" || fail "existing TS_AUTHKEY not in the seed"
 	grep -qx 'ANTHROPIC_API_KEY=sk-ant-api03-SENTINELexist2' "$T/sec" || fail "existing ANTHROPIC_API_KEY not in the seed"
@@ -1129,8 +1186,8 @@ t_wizard_existing_secrets_unsafe() {
 	wiz_setup wizard_existing_secrets_unsafe
 	printf '%s\n' 'TS_AUTHKEY=tskey-auth-SENTINELloose1' >/root/agos.secrets
 	chmod 644 /root/agos.secrets
-	answers "yesno 0" "menu 0 default" "msgbox 0" "menu 0 ssh" "checklist 0 1" "inputbox 0" "passwordbox 0" \
-		"passwordbox 0" "msgbox 0" "menu 0 create" "textbox 0"
+	answers "yesno 0" "menu 0 default" "msgbox 0" "menu 0 ssh" "checklist 0 1" "inputbox 0" \
+		"checklist 0 claude_code t3code" "passwordbox 0" "passwordbox 0" "msgbox 0" "menu 0 create" "textbox 0"
 	wizard
 	expect_rc 0
 	expect_screen 03 'cannot use it'
@@ -1146,8 +1203,9 @@ t_wizard_cancel() {
 		"yesno 1"
 		"yesno 0|menu 255"
 		"yesno 0|menu 0 default|menu 0 tailscale|passwordbox 1"
-		"yesno 0|menu 0 default|menu 0 tailscale|passwordbox 0 tskey-client-SENTINELcan1|checklist 0 1|inputbox 0|passwordbox 0 sk-ant-api03-SENTINELcan2|passwordbox 0|msgbox 255"
-		"yesno 0|menu 0 default|menu 0 tailscale|passwordbox 0 tskey-client-SENTINELcan3|checklist 0 1|inputbox 0|passwordbox 0|passwordbox 0|msgbox 0|menu 0 quit"
+		"yesno 0|menu 0 default|menu 0 tailscale|passwordbox 0 tskey-client-SENTINELcan1|checklist 0 1|inputbox 0|checklist 0 t3code|passwordbox 0 sk-ant-api03-SENTINELcan2|passwordbox 0|msgbox 255"
+		"yesno 0|menu 0 default|menu 0 tailscale|passwordbox 0 tskey-client-SENTINELcan3|checklist 0 1|inputbox 0|checklist 0 claude_code t3code|passwordbox 0|passwordbox 0|msgbox 0|menu 0 quit"
+		"yesno 0|menu 0 default|menu 0 tailscale|passwordbox 0 tskey-client-SENTINELcan4|checklist 0 1|inputbox 0|checklist 255"
 		"yesno 0|menu 0 advanced|inputbox 1"
 	)
 	wiz_setup wizard_cancel
@@ -1263,6 +1321,12 @@ t_wizard_flags_preseed() {
 	wizard --wizard --secrets-file "$T/flag.secrets" --ssh-key-file "$T/id.pub"
 	expect_rc 1
 	expect_screen 03 "Found $T/flag.secrets with these keys"
+	# --agents preselects the "Agent apps" boxes
+	rm -rf "$FAKE_WT_SCREENS" "$FAKE_WT_LOG" "$FAKE_WT_LOG.n"
+	answers "yesno 0" "menu 0 default" "menu 0 ssh" "checklist 0 1" "inputbox 0" "checklist 255"
+	wizard --wizard --agents t3code
+	expect_rc 1
+	expect_screen 06 'items: claude_code Claude Code: .* OFF t3code T3 Code: .* ON'
 	finish
 }
 
@@ -1270,7 +1334,7 @@ t_wizard_flags_preseed() {
 
 TESTS=(t_help t_usage_errors t_not_root t_preflight_failures t_secrets_file_checks
 	t_dry_run_human t_dry_run_json t_dry_run_download_checks t_create t_create_idempotent
-	t_create_arm64 t_create_dir_storage t_create_with_config_and_network t_create_import_fallback
+	t_create_arm64 t_create_dir_storage t_create_with_config_and_network t_agents_flag t_create_import_fallback
 	t_create_failure_cleans_up t_create_timeout t_create_guest_failed t_create_vm_died t_no_tty_needs_yes
 	t_tty_prompt t_env_equivalents t_vmid_in_use t_status t_reset t_destroy t_isolate
 	t_download_and_verify t_signature t_truncated_download_runs_nothing t_make_seed

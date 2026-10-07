@@ -28,7 +28,7 @@ docs/              spec.md (this file), architecture notes
 
 ## Versions and naming
 
-- Version: `0.1.0` (single source: `VERSION` file at repo root).
+- Version: `0.1.1` (single source: `VERSION` file at repo root).
 - Architectures use Debian names: `amd64`, `arm64`.
 - Release artifacts (GitHub release `v<version>`):
   - `agos-<version>-<arch>.raw.xz`  raw GPT UEFI disk image, xz-compressed
@@ -67,6 +67,14 @@ docs/              spec.md (this file), architecture notes
   - `agentd.service` — `agentd serve`, `Type=notify`, `WatchdogSec=30`,
     `After` agos-session, `Restart=always`.
   - All three are wanted by `default.target` of the user manager.
+  - `agos-t3code.service` — the T3 Code desktop app on `DISPLAY=:1`,
+    `Requires`/`After` agos-session (and wanted by it), `Restart=always`;
+    enabled or disabled (`systemctl --global`) by `agos-firstboot` from
+    `[agents] t3code`. Its windows open on XFCE workspace 2: the session has
+    two workspaces only while it is enabled, `/usr/lib/agos/pin-workspace`
+    sets `_NET_WM_DESKTOP` before they are mapped, and xfwm4 runs with
+    `activate_action=none`, `scroll_workspaces=false`, `wrap_windows=false`
+    so nothing moves the agent off workspace 1.
 - System services: `agos-firstboot.service` (oneshot, after cloud-init's
   config stage so `write_files` has run, before the user manager of `agent`
   starts, i.e. `Before=user@1000.service`), `agos-ready.service` (waits for
@@ -89,6 +97,15 @@ docs/              spec.md (this file), architecture notes
   "bypassPermissions"` and `skipDangerousModePermissionPrompt: true`;
   `~/.claude.json` with `hasCompletedOnboarding: true` and an MCP server
   `desktop` pointing at `/opt/agentd/bin/agentd mcp`).
+- T3 Code (profile `agents`): the pinned Linux AppImage of
+  `github.com/pingdotgg/t3code` (version and per-arch sha256 in
+  `image/pins.env`), unpacked at build time to `/opt/t3code` (no FUSE),
+  started by `agos-t3code.service` with `T3CODE_DISABLE_AUTO_UPDATE=true`,
+  `T3CODE_TELEMETRY_ENABLED=false` and `--password-store=basic`; pre-seeded
+  (merged) `~/.t3/userdata/client-settings.json` `onboardingCompletedAt` (no
+  welcome wizard) and `~/.t3/userdata/settings.json`
+  `enableProviderUpdateChecks: false` (Claude Code is apt-managed). T3
+  Connect needs a one-time human sign-in (no unattended token).
 - Zero-touch hardening: every row of the hardening table in the report that
   applies to a VM guest (see "Zero-touch hardening" there) is implemented in
   the image.
@@ -140,7 +157,8 @@ serve = true                     # https://<host>.<tailnet>.ts.net -> viewer
 ssh = false                      # Tailscale SSH
 
 [agents]
-claude_code = true
+claude_code = true               # pre-seed Claude Code (it is installed either way)
+t3code = true                    # run T3 Code on workspace 2 (agos-t3code.service)
 ```
 
 ### `/etc/agos/secrets.env` (0600 root, `KEY=value` lines)
@@ -167,7 +185,8 @@ step on every boot so config edits take effect after a reboot.
    without a password has no users, so every viewer has control.
 3. Render: KasmVNC config for `agent`, agentd config + tokens, user
    environment, `/etc/issue.d/agos.issue` (console banner with IP, viewer URL,
-   status), Claude Code pre-seed.
+   status), Claude Code and T3 Code pre-seeds; `systemctl --global
+   enable|disable agos-t3code.service` from `[agents] t3code`.
 4. If Tailscale is enabled: `tailscale up` with the key, tags, hostname; then
    `tailscale serve` as above. Remove the key from disk after a successful
    join only if it is a one-off key (keep OAuth client secrets).
@@ -371,7 +390,8 @@ root. Subcommands `create` (default), `status`, `reset`, `destroy`; flags
 `--dry-run`, `--json`, `--yes`, `--vmid`, `--name`, `--storage`, `--bridge`,
 `--cores`, `--memory`, `--disk`, `--version`, `--image-url`, `--image-file`,
 `--ssh-key-file`, `--secrets-file` (default `/root/agos.secrets`),
-`--config-file`, `--isolate`, plus `--iso-storage`, `--cpu`,
+`--config-file`, `--agents` (`claude-code,t3code`, either, or `none`: an
+`[agents]` table appended to the seed's `config.toml`), `--isolate`, plus `--iso-storage`, `--cpu`,
 `--network-config`, `--image-sha256`, `--require-signature`, `--isolate-dns`,
 `--timeout`, `--onboot`, `--wizard`, `--no-wizard`. Every flag has an
 `AGOS_*` environment equivalent (e.g. `AGOS_YES=1`, `AGOS_STORAGE`) except
@@ -387,7 +407,8 @@ with no arguments (or only `create`), with stdout on a terminal and a usable
 subcommand, `--no-wizard`/`AGOS_NO_WIZARD=1` or without a terminal, so the
 flag behaviour above is unchanged for agents and scripts. Its answers set the
 same variables as the flags; typed secrets go to a private temp file that
-only feeds the seed. Tailscale tags in the generated `config.toml`:
+only feeds the seed. An "Agent apps" checklist (Claude Code, T3 Code, both
+ticked) writes `[agents] claude_code` and `t3code`. Tailscale tags in the generated `config.toml`:
 `["tag:agos"]` for `tskey-client-` secrets, `[]` for `tskey-auth-` keys. `--json` prints exactly one JSON object on
 stdout (`vmid`, `name`, `state`, `ip`, `urls.viewer`, `urls.agentd`, ...);
 progress goes to stderr. Builds its own NoCloud seed ISO (label `CIDATA`)

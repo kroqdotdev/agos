@@ -224,7 +224,7 @@ agent | guest)
 			# FAKE_STALE_READS: the first N reads after a start still show the
 			# state.json from the previous boot (what a rolled-back snapshot holds).
 			if ((n < ${FAKE_STALE_READS:-0})); then boot=previous-boot; fi
-			json_out 0 "{\"state\": \"${FAKE_GUEST_STATE:-ready}\", \"version\": \"0.1.0\", \"message\": \"fake guest\", \"boot_id\": \"$boot\"}"
+			json_out 0 "{\"state\": \"${FAKE_GUEST_STATE:-ready}\", \"version\": \"${FAKE_GUEST_VERSION:-fake}\", \"message\": \"fake guest\", \"boot_id\": \"$boot\"}"
 		fi
 		;;
 	"cat /proc/sys/kernel/random/boot_id")

@@ -24,6 +24,9 @@ with a takeover button that pauses the agent.
   boot through cloud-init, never baked into the image.
 - **Claude Code preinstalled** and pre-seeded so it never asks a question,
   with agentd registered as its `desktop` MCP server.
+- **[T3 Code](https://github.com/pingdotgg/t3code) preinstalled** (optional,
+  on by default) on the desktop's second workspace, out of the agent's view;
+  sign in to T3 Connect once and drive the VM's agents from your phone.
 
 ## Quick start (Proxmox VE)
 

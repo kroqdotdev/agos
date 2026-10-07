@@ -24,6 +24,14 @@ setprop xfce4-session /shutdown/LockScreen bool false
 setprop xfce4-screensaver /saver/enabled bool false
 setprop xfce4-screensaver /lock/enabled bool false
 
+# T3 Code ([agents] t3code, agos-t3code.service) gets a second workspace to
+# itself; without it there is one, so the agent's windows cannot get lost.
+workspaces=1
+if [[ -x /opt/t3code/t3code ]] && systemctl --user is-enabled --quiet agos-t3code.service 2>/dev/null; then
+  workspaces=2
+fi
+setprop xfwm4 /general/workspace_count int "$workspaces"
+
 dbus-update-activation-environment --systemd DISPLAY XAUTHORITY XDG_CURRENT_DESKTOP 2>/dev/null || true
 
 exec startxfce4

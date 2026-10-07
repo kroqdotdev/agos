@@ -77,9 +77,10 @@ lint: builder
 	docker run --rm -v $(REPO):/mnt -w /mnt/image koalaman/shellcheck:stable \
 		-x -P SCRIPTDIR:. scripts/*.sh mkosi.postinst.chroot mkosi.extra/usr/lib/agos/agos-display \
 		mkosi.extra/usr/lib/agos/agos-session mkosi.extra/usr/lib/agos/wait-display \
+		mkosi.extra/usr/lib/agos/agos-t3code \
 		mkosi.extra/usr/bin/agos-browser mkosi.extra/etc/profile.d/agos.sh
 	$(DOCKER_TEST) sh -c 'for f in mkosi.extra/usr/lib/agos/agos-firstboot mkosi.extra/usr/lib/agos/viewer-perm \
-		mkosi.extra/usr/bin/agos scripts/boot_test.py; do python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" $$f || exit 1; done'
+		mkosi.extra/usr/lib/agos/pin-workspace mkosi.extra/usr/bin/agos scripts/boot_test.py; do python3 -c "import ast,sys; ast.parse(open(sys.argv[1]).read())" $$f || exit 1; done'
 
 clean:
 	$(DOCKER_MKOSI) bash -c 'rm -rf mkosi.output/* /var/tmp/mkosi-*'

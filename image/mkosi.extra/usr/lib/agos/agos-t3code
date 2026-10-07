@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Start the T3 Code desktop app (/opt/t3code) on the agent's display, on the
+# second XFCE workspace (systemd user unit agos-t3code). Screenshot-driven
+# agents on workspace 1 never see it; a human switches to it in the viewer.
+set -euo pipefail
+
+export DISPLAY="${DISPLAY:-:1}"
+app=/opt/t3code/t3code
+workspace=1   # 0-based: XFCE's "Workspace 2"
+
+# Wait for xfwm4: a window mapped before the window manager runs would show up
+# on the agent's screen.
+for ((i = 0; i < 600; i++)); do
+  wmctrl -m >/dev/null 2>&1 && break
+  sleep 0.1
+done
+
+# prevents the window from opening on, and taking focus on, the agent's
+# workspace: tags T3 Code's windows with that workspace before they are mapped.
+# Matched by PID ($$ becomes T3 Code below) and by WM_CLASS (Electron derives
+# it from the desktop entry name, com.t3tools.T3Code, not from --class).
+/usr/lib/agos/pin-workspace --pid $$ "$workspace" com.t3tools.t3code t3code &
+
+# --password-store=basic prevents keyring prompts (agos has no keyring; same
+# as agos-browser). No --no-sandbox: the user-namespace sandbox works here.
+exec "$app" --password-store=basic "$@"

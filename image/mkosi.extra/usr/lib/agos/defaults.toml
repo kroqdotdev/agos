@@ -27,4 +27,5 @@ serve = true                     # https://<host>.<tailnet>.ts.net -> viewer, :8
 ssh = false                      # Tailscale SSH
 
 [agents]
-claude_code = true
+claude_code = true               # pre-seed Claude Code (onboarding, permissions, MCP "desktop")
+t3code = true                    # T3 Code desktop app on workspace 2 (agos-t3code.service)

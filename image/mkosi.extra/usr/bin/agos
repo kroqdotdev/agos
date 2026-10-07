@@ -5,6 +5,9 @@
   agos apply               re-run agos-firstboot and restart the desktop (root)
   agos viewer view|control|status
                            switch the KasmVNC viewer's input permission
+  agos t3 link|status|unlink|logout
+                           T3 Connect without the GUI: `link` prints a URL and a
+                           code to approve on any device, then restarts T3 Code
   agos version
 """
 
@@ -49,7 +52,10 @@ def cmd_status(args) -> int:
         fb = firstboot_module()
         live = fb.checks(state)
     elif os.getuid() == 1000:
-        for unit in ("agos-display.service", "agos-session.service", "agentd.service"):
+        units = ["agos-display.service", "agos-session.service", "agentd.service"]
+        if state.get("agents", {}).get("t3code"):
+            units.append("agos-t3code.service")
+        for unit in units:
             res = subprocess.run(["systemctl", "--user", "is-active", "--quiet", unit])
             live[unit] = res.returncode == 0
     report = dict(state, live=live, units=system_units())
@@ -63,6 +69,11 @@ def cmd_status(args) -> int:
     print(f"  viewer     {v.get('url', '?')}  auth={'yes (user ' + v.get('user', '') + ')' if v.get('auth') else 'no'}"
           f"  tls={'yes' if v.get('tls') else 'no'}")
     print(f"  agentd     {ag.get('listen', '?')}  installed={'yes' if ag.get('installed') else 'no'}")
+    t3 = state.get("t3code", {})
+    if t3.get("enabled"):
+        print(f"  t3code     on, workspace {t3.get('workspace')}  version {t3.get('version') or '?'}")
+    else:
+        print(f"  t3code     {'off' if t3.get('installed') else 'not installed'}")
     if ts.get("enabled"):
         print(f"  tailscale  {ts.get('state')}  {ts.get('dns_name', '')}  {' '.join(ts.get('urls', []))}")
     else:
@@ -87,7 +98,15 @@ def cmd_apply(args) -> int:
     rc = subprocess.run(["systemctl", "restart", "agos-firstboot.service"]).returncode
     fb = firstboot_module()
     prefix, env = fb.agent_env()
+    # [agents] t3code toggles agos-t3code.service in /etc/systemd/user
+    subprocess.run(prefix + ["systemctl", "--user", "daemon-reload"], env=env)
     subprocess.run(prefix + ["systemctl", "--user", "restart", "agos-display.service", "agentd.service"],
+                   env=env)
+    try:
+        t3_on = json.loads(STATE.read_text()).get("agents", {}).get("t3code", False)
+    except (OSError, ValueError):
+        t3_on = False
+    subprocess.run(prefix + ["systemctl", "--user", "start" if t3_on else "stop", "agos-t3code.service"],
                    env=env)
     subprocess.run(["systemctl", "restart", "agos-ready.service"])
     return rc
@@ -95,6 +114,32 @@ def cmd_apply(args) -> int:
 
 def cmd_viewer(args) -> int:
     return subprocess.run(["/usr/lib/agos/viewer-perm", args.mode]).returncode
+
+
+T3_CLI = ["/opt/t3code/t3code", "/opt/t3code/resources/app.asar/apps/server/dist/bin.mjs"]
+
+
+def cmd_t3(args) -> int:
+    # T3 Code's own CLI (its bundled server, run by the app's Electron in node
+    # mode) as the agent user, so it reads and writes the app's own state.
+    if not Path(T3_CLI[0]).exists():
+        print("agos t3: T3 Code is not installed in this image", file=sys.stderr)
+        return 1
+    if os.geteuid() == 0:
+        prefix, env = firstboot_module().agent_env()
+    else:  # already the agent user (ssh agent@...)
+        prefix, env = [], dict(os.environ)
+    env["ELECTRON_RUN_AS_NODE"] = "1"
+    cmd = prefix + T3_CLI + ["connect", args.action] + (["--headless"] if args.action == "link" else [])
+    if args.action == "status":
+        cmd.append("--log-level=warn")  # hides the database migration log on every run
+    rc = subprocess.run(cmd, env=env).returncode
+    if rc == 0 and args.action != "status":
+        # T3 Code picks up a new authorization when it starts
+        env.pop("ELECTRON_RUN_AS_NODE")
+        subprocess.run(prefix + ["systemctl", "--user", "restart", "agos-t3code.service"], env=env)
+        print("agos t3: restarted T3 Code")
+    return rc
 
 
 def cmd_version(args) -> int:
@@ -116,6 +161,9 @@ def main() -> int:
     p = sub.add_parser("viewer", help="switch the viewer between view-only and control")
     p.add_argument("mode", choices=["view", "control", "status"])
     p.set_defaults(func=cmd_viewer)
+    p = sub.add_parser("t3", help="T3 Connect without the GUI (link prints a device code)")
+    p.add_argument("action", choices=["link", "status", "unlink", "logout"])
+    p.set_defaults(func=cmd_t3)
     sub.add_parser("version").set_defaults(func=cmd_version)
     args = ap.parse_args()
     return args.func(args)

@@ -58,19 +58,20 @@ image/
   builder/Dockerfile     pinned toolchain: debian:trixie-slim@sha256, mkosi v27.1 (git, commit-checked),
                          systemd-repart/ukify/bootctl 257, qemu, OVMF/AAVMF, xorriso, uv
   Makefile               docker wrappers; mkosi runs --privileged (mount namespaces, no loop devices)
-  pins.env               KasmVNC .deb sha256s, Tailscale + Claude Code apt key hashes/fingerprints
-  scripts/sync.sh        fetch + verify pinned inputs into mkosi.packages/ and mkosi.sandbox/
+  pins.env               KasmVNC .deb and T3 Code AppImage sha256s, Tailscale + Claude Code apt key hashes/fingerprints
+  scripts/sync.sh        fetch + verify pinned inputs into mkosi.packages/, mkosi.sandbox/ and .cache/t3code/
+                         (the T3 Code AppImage is unpacked there with unsquashfs, never executed)
   scripts/build.sh       sync, export agentd's uv.lock + build its wheel, mkosi build, chown outputs
   scripts/convert.sh     raw -> qcow2 (zlib) / raw.xz, SHA256SUMS
   scripts/boot_test.py   zero-touch boot test (boot-test.sh wraps it); vm-ssh.sh, viewer-check.sh helpers
   mkosi.conf             distribution, package list, boot, output (see comments)
   mkosi.conf.d/          per-architecture: kernel package, output name
-  mkosi.profiles/agents  Claude Code (profile on by default)
+  mkosi.profiles/agents  Claude Code, T3 Code's runtime libraries (profile on by default)
   mkosi.repart/          build-time partitions: ESP (512M, vfat) + root (ext4, minimal, grow flag)
   mkosi.skeleton/        Debian deb822 sources (keeps mkosi from writing -debug/deb-src lists)
   mkosi.sandbox/         Tailscale + Claude Code apt sources for the build (keys fetched by sync.sh)
   mkosi.extra/           every file the image ships (configs, units, agos-firstboot, CLIs)
-  mkosi.postinst.chroot  users, kernel cmdline, masks, panel seed, vendor repos, agentd venv, build-info
+  mkosi.postinst.chroot  users, kernel cmdline, masks, panel seed, vendor repos, agentd venv, /opt/t3code, build-info
   mkosi.version          ImageVersion from ../VERSION
 ```
 
@@ -109,6 +110,16 @@ image/
   Linux-package-manager install method; system-wide `/usr/bin/claude`, works
   offline at first boot, and is updated by unattended-upgrades. The repository
   and key are installed into the image for that.
+- **T3 Code:** the pinned Linux AppImage from
+  [pingdotgg/t3code](https://github.com/pingdotgg/t3code/releases) (x86_64
+  and arm64 builds exist; version and sha256 per architecture in `pins.env`).
+  `scripts/sync.sh` finds the squashfs payload after the AppImage's ELF
+  runtime and unpacks it with `unsquashfs`, so nothing from the download runs
+  at build time and the image needs no FUSE (`libfuse2t64`); the postinst
+  copies the tree to `/opt/t3code` (profile `agents` only). The unpacked app
+  cannot update itself (electron-updater only updates a mounted AppImage or
+  the `.deb`): bump `pins.env` and rebuild. Runtime libraries are exactly the
+  `Depends` of the vendor's `.deb` for the same release.
 
 ## What is in the image
 
@@ -121,8 +132,9 @@ Liberation, Noto core + color emoji, Droid fallback for CJK); KasmVNC 1.5.0;
 xdotool, xclip, wmctrl, x11-utils, x11-xserver-utils, ffmpeg, at-spi2-core,
 python3-gi, gir1.2-atspi-2.0; chromium, firefox-esr; tailscale; python3,
 python3-venv/pip, nodejs, npm, git, curl, jq, ripgrep, tmux and friends;
-claude-code (profile `agents`). The JSON package manifest lands next to the
-image (`agos-<ver>-<arch>.manifest`).
+claude-code and T3 Code's Electron runtime libraries (profile `agents`),
+python3-xlib. The JSON package manifest lands next to the image
+(`agos-<ver>-<arch>.manifest`).
 
 | Path | What |
 |---|---|
@@ -130,7 +142,9 @@ image (`agos-<ver>-<arch>.manifest`).
 | `/usr/lib/agos/defaults.toml` | configuration layer 1 |
 | `/usr/lib/agos/agos-display`, `agos-session`, `wait-display` | Xvnc and XFCE launchers for the user units |
 | `/usr/lib/agos/viewer-perm {view\|control\|status}` | KasmVNC viewer write toggle (agentd takeover hooks) |
-| `/usr/lib/agos/build-info.json` | version, arch, kernel, KasmVNC, Claude Code, agentd status, build time |
+| `/usr/lib/agos/agos-t3code`, `pin-workspace` | T3 Code launcher; opens an app's windows on another XFCE workspace |
+| `/opt/t3code` | T3 Code desktop app (unpacked AppImage, Electron) |
+| `/usr/lib/agos/build-info.json` | version, arch, kernel, KasmVNC, Claude Code, T3 Code, agentd status, build time |
 | `/usr/bin/agos` | `agos status [--json]`, `agos apply`, `agos viewer view\|control\|status`, `agos version` |
 | `/usr/bin/agos-browser` | Chromium with the spec's flags, profile `~/.config/agos-chromium`, CDP 127.0.0.1:9222 |
 | `/opt/agentd` | agentd venv (`--system-site-packages`) |
@@ -142,7 +156,10 @@ Units (spec "Guest image"): user units `agos-display` (Xvnc, `Upholds=`
 the session so XFCE comes back after an Xvnc restart), `agos-session`
 (`BindsTo` the display), `agentd` (`Type=notify`, `WatchdogSec=30`), all
 `Restart=always` with no start-rate limit, enabled through
-`/usr/lib/systemd/user-preset/` and `ConditionUser=agent`. System units
+`/usr/lib/systemd/user-preset/` and `ConditionUser=agent`. `agos-t3code`
+(T3 Code, see below) is wanted by and `Requires` the session, backs off to a
+restart a minute if it keeps crashing, and is switched on or off with
+`systemctl --global enable|disable` by `agos-firstboot` from `[agents] t3code`. System units
 `agos-firstboot` (after cloud-init's config stage, `Before=user@1000.service`),
 `agos-ready`, `agos-ssh-keygen`, plus the presets in
 `/usr/lib/systemd/system-preset/10-agos.preset` (`tailscaled` disabled until
@@ -186,8 +203,12 @@ by `/var/lib/agos/firstboot.done`):
    pre-seed (merged, never replaced: `bypassPermissions`,
    `skipDangerousModePermissionPrompt`, `theme`, `hasCompletedOnboarding`,
    trusted `~` and `~/work`, MCP server `desktop` → `/opt/agentd/bin/agentd
-   mcp`, pre-approved `ANTHROPIC_API_KEY`), the console banner
-   `/etc/issue.d/agos.issue`, and the hostname if cloud-init did not set one.
+   mcp`, pre-approved `ANTHROPIC_API_KEY`), the T3 Code pre-seed (merged:
+   `~/.t3/userdata/client-settings.json` `onboardingCompletedAt`,
+   `~/.t3/userdata/settings.json` `enableProviderUpdateChecks: false`),
+   `agos-t3code.service` enabled or disabled from `[agents] t3code`, the
+   console banner `/etc/issue.d/agos.issue`, and the hostname if cloud-init
+   did not set one.
 4. Tailscale when `enabled = true`, or `auto` with `TS_AUTHKEY` (or an earlier
    join): enable `tailscaled`, `tailscale up --auth-key=file:...` (OAuth client
    secrets get `?preauthorized=true&ephemeral=false`, plus `--advertise-tags`,
@@ -221,8 +242,17 @@ without), pinned geometry, no dialog windows, agentd click/type into a
 terminal, takeover → `HUMAN_IN_CONTROL` → handback → `STALE_FRAME` until a new
 screenshot, the KasmVNC write toggle via the hooks, `agos-browser` (one
 Chromium window, CDP up), Firefox ESR without first-run pages, the Claude
-Code pre-seed, idle memory, and an unattended reboot back to `ready`.
-Results: `out/boot-test-<arch>/results.json`; screenshots `out/<arch>-*.png`.
+Code pre-seed, nothing listening on 5355/5353 (LLMNR/mDNS), T3 Code (running;
+alone on workspace 2 with the agent's workspace still current and its focus
+untouched; its pre-seed and xfwm4 settings; scrolling on the desktop keeps
+the workspace; Settings → Connections → "Sign in to T3 Connect" opens its
+in-app sign-in without a new window; `[agents] t3code = false` + `agos apply`
+stops it and drops the second workspace, `true` brings both back; back on
+workspace 2 after the reboot), idle memory, and an unattended reboot back to
+`ready`.
+Results: `out/boot-test-<arch>/results.json`; screenshots `out/<arch>-*.png`
+(`<arch>-t3code.png` and `<arch>-t3code-signin.png` are workspace 2, viewed
+by switching to it in the test VM and back).
 `BOOT_TEST_ARGS=--keep` leaves the VM running; then `scripts/vm-ssh.sh` opens
 a shell and `scripts/viewer-check.sh` opens the KasmVNC web client in a pinned
 Playwright Chromium (TLS, basic auth, WebSocket) and saves
@@ -297,6 +327,13 @@ hypervisor's job (VM-first, no MOK, no encryption).
 | Wrong clock breaks TLS | systemd-timesyncd enabled; firstboot ordered after `network-online.target` | presets |
 | NetworkManager captive portal / secret prompts | not applicable: systemd-networkd only (cloud-init `networkd` renderer, DHCP fallback for `en*`/`eth*`) | `network/99-agos-dhcp.network` |
 | Group-writable shipped files (Firefox then silently ignores its policies) | postinst strips group/other write from everything in `mkosi.extra/` and `mkosi.skeleton/` | postinst |
+| T3 Code welcome wizard (connect computers, check agents, import projects) | `onboardingCompletedAt` in `~/.t3/userdata/client-settings.json` (merged, never replaced) | firstboot |
+| T3 Code update checks and "update available" notices | `T3CODE_DISABLE_AUTO_UPDATE=true`; an unpacked AppImage cannot update itself anyway | `user/agos-t3code.service` |
+| T3 Code keyring probing / "unlock keyring" | `--password-store=basic` (agos has no keyring, as for Chromium) | `agos-t3code` |
+| T3 Code opening on, or taking focus from, the agent's workspace | its windows get `_NET_WM_DESKTOP` = workspace 2 before they are mapped (`pin-workspace`); xfwm4 `activate_action=none`, so its `focus()` neither pulls it over nor switches workspaces; the taskbar does not show other workspaces' urgent windows (`include-all-blinking=false`) | `agos-t3code`, `xfwm4.xml`, postinst |
+| The agent landing on workspace 2 by scrolling on the desktop or dragging a window past the edge | xfwm4 `scroll_workspaces=false`, `wrap_windows=false`; a single workspace whenever T3 Code is off | `xfwm4.xml`, `agos-session` |
+| A crash-looping desktop app | `Restart=always`, backing off to one attempt a minute (`RestartSteps`, `RestartMaxDelaySec`) | `user/agos-t3code.service` |
+| LLMNR / mDNS responders listening on all interfaces (5355, 5353) | `LLMNR=no`, `MulticastDNS=no` | `/etc/systemd/resolved.conf.d/90-agos.conf` |
 
 Security notes: SSH is keys only, no root login, root and `agent` passwords
 locked; agentd always requires a bearer token on TCP; the viewer has TLS and
@@ -310,7 +347,7 @@ agent through sudo, which the threat model accepts (tier-1 secrets only).
 
 The recipe is architecture-neutral except `mkosi.conf.d/10-arm64.conf`
 (`linux-image-arm64`, output name), the KasmVNC `trixie_1.5.0_arm64` package
-(pinned in `pins.env`), `console=ttyAMA0` (postinst), the AAVMF firmware in
+and the `T3-Code-<ver>-arm64.AppImage` (both pinned in `pins.env`), `console=ttyAMA0` (postinst), the AAVMF firmware in
 the boot test, and `EFI/BOOT/BOOTAA64.EFI` from `bootctl
 --all-architectures`. `scripts/build.sh` refuses to cross-build: no binfmt or
 qemu-user is ever registered. Build each architecture on a native runner.
@@ -348,7 +385,7 @@ release upload belong to the release workflow.
 - **arm64 is unverified**: the configuration resolves (`mkosi
   --architecture=arm64 summary`) and every arm64 input exists (KasmVNC arm64
   deb, `linux-image-arm64`, chromium/firefox-esr/tailscale/claude-code arm64
-  packages, AAVMF), but no arm64 image has been built or booted here (no
+  packages, T3 Code's arm64 AppImage, AAVMF), but no arm64 image has been built or booted here (no
   native arm64 host, binfmt deliberately not used). Expect the first CI run to
   surface something.
 - **Tailscale is untested end to end** (no tailnet here): `tailscale up` with
@@ -358,7 +395,25 @@ release upload belong to the release workflow.
   every viewer reaches KasmVNC from 127.0.0.1, so its brute-force blacklist
   (5 failures → 10 s) is shared by all tailnet viewers.
 - KasmVNC comes from a pinned `.deb`, not an apt repository: it gets no
-  automatic security updates; bump `pins.env` and rebuild.
+  automatic security updates; bump `pins.env` and rebuild. The same holds for
+  T3 Code (pinned AppImage, self-update off).
+- **T3 Connect needs a human once.** There is no token, environment variable
+  or file that signs an environment in unattended. In the viewer: workspace 2
+  → T3 Code → Settings (gear, bottom left) → Connections → *Sign in to T3
+  Connect* (Apple, GitHub, Google, Microsoft or e-mail code, inside T3 Code)
+  → turn on *T3 Connect*. Without the GUI, over SSH: `agos t3 link` runs
+  T3 Code's own `connect link --headless` (a URL and a code to approve on any
+  device) and restarts T3 Code; `agos t3 status` shows the result. Neither path was exercised end to
+  end here (no T3 account); the GUI dialog and `connect status` were.
+- T3 Code finds no keyring (by design), so Electron's safe storage is
+  `basic_text`: what T3 Code would encrypt with it (saved *remote*
+  environment tokens) is not protected beyond the 0700 home directory.
+- With T3 Code on, xfwm4's workspace shortcuts (Ctrl+F1…F12,
+  Ctrl+Alt+arrows) can still take the agent to workspace 2; the panel's
+  workspace switcher shows T3 Code's icon in the second box. Scrolling on the
+  desktop and dragging windows past the edge no longer switch workspaces.
+- T3 Code 0.0.45 exits with SIGTRAP when stopped (Electron quitting on
+  SIGTERM); the unit counts that as a clean stop.
 - Debian packages are whatever trixie (+security) serves at build time;
   builds are not bit-for-bit reproducible. `MKOSI_ARGS=--snapshot=<id>`
   (snapshot.debian.org) pins them when needed.
@@ -380,6 +435,13 @@ release upload belong to the release workflow.
 - KasmVNC: new release → update `KASMVNC_*` in `pins.env` (sha256 = the
   GitHub release asset `digest`), check `agos-display`'s arguments against the
   new `vncserver` wrapper.
+- T3 Code: new release → `T3CODE_VERSION`, `T3CODE_URL_BASE` and
+  `T3CODE_SHA256_{amd64,arm64}` (the GitHub asset `digest` of
+  `T3-Code-<ver>-x86_64.AppImage` / `-arm64.AppImage`; cross-check the sha512
+  in the release's `latest-linux*.yml`); compare the `Depends` of the
+  release's `.deb` with `mkosi.profiles/agents.conf`; check the window class
+  (`pin-workspace` also matches by PID) and that the boot test's sign-in
+  click path still fits the layout.
 - Keys: `TAILSCALE_KEYRING_*`, `CLAUDE_CODE_KEY_*` in `pins.env`
   (`scripts/sync.sh` verifies both sha256 and fingerprint).
 - Builder: base image digest, `MKOSI_TAG`/`MKOSI_COMMIT`, `UV_VERSION`/sha256s

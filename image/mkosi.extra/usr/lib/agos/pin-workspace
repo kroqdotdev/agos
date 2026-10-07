@@ -1,0 +1,111 @@
+#!/usr/bin/python3
+"""pin-workspace [--pid PID] WORKSPACE [CLASS...]: open an app's windows on another workspace.
+
+Watches the X display ($DISPLAY) for new top-level windows of the app (its
+_NET_WM_PID is PID, or its WM_CLASS instance or class is one of CLASS) and
+sets _NET_WM_DESKTOP = WORKSPACE (0-based) on them before the app maps them. xfwm4 reads that hint when it manages a
+window, so the window opens on that workspace: it never appears on the
+agent's workspace and never takes the keyboard focus there. Later windows
+follow the app's main window if a human moved it; dialogs (transient
+windows) are left to the window manager, which keeps them with their parent.
+
+Runs next to the app (agos-t3code) and exits with the X connection.
+"""
+
+import sys
+import time
+
+from Xlib import X, Xatom, display, error
+from Xlib.protocol import event as xevent
+
+LATE_GRACE_S = 120  # move windows mapped before we saw them only this long after start
+
+
+def main() -> int:
+    args = sys.argv[1:]
+    pid = None
+    if args[:1] == ["--pid"] and len(args) > 1 and args[1].isdigit():
+        pid, args = int(args[1]), args[2:]
+    if not args or not args[0].isdigit() or (pid is None and len(args) < 2):
+        print(__doc__.split("\n")[0], file=sys.stderr)
+        return 2
+    default_ws, classes = int(args[0]), {c.lower() for c in args[1:]}
+    started = time.monotonic()
+    d = display.Display()
+    d.set_error_handler(lambda *_: None)  # windows may vanish between events
+    root = d.screen().root
+    net_wm_desktop = d.intern_atom("_NET_WM_DESKTOP")
+    net_client_list = d.intern_atom("_NET_CLIENT_LIST")
+    net_wm_pid = d.intern_atom("_NET_WM_PID")
+    handled: set[int] = set()
+
+    def matches(win) -> bool:
+        cls = win.get_wm_class()
+        if cls and (cls[0].lower() in classes or cls[1].lower() in classes):
+            return True
+        if pid is not None:
+            prop = win.get_full_property(net_wm_pid, Xatom.CARDINAL)
+            return bool(prop) and int(prop.value[0]) == pid
+        return False
+
+    def app_workspace() -> int:
+        """The workspace the app's managed windows are on (default: WORKSPACE)."""
+        prop = root.get_full_property(net_client_list, Xatom.WINDOW)
+        for wid in prop.value if prop else []:
+            win = d.create_resource_object("window", wid)
+            try:
+                if not matches(win):
+                    continue
+                ws = win.get_full_property(net_wm_desktop, Xatom.CARDINAL)
+            except error.XError:
+                continue
+            if ws and ws.value[0] != 0xFFFFFFFF:
+                return int(ws.value[0])
+        return default_ws
+
+    def consider(win) -> None:
+        if win.id in handled:
+            return
+        try:
+            attrs = win.get_attributes()
+            if attrs.override_redirect or not matches(win):
+                return  # not ours (yet: WM_CLASS / _NET_WM_PID may follow as a PropertyNotify)
+            handled.add(win.id)
+            if win.get_wm_transient_for() is not None:
+                return
+            ws = app_workspace()
+            if attrs.map_state == X.IsUnmapped:
+                win.change_property(net_wm_desktop, Xatom.CARDINAL, 32, [ws])
+            elif time.monotonic() - started < LATE_GRACE_S:
+                # already mapped (we were late): ask the window manager to move it
+                msg = xevent.ClientMessage(window=win, client_type=net_wm_desktop,
+                                           data=(32, [ws, 2, 0, 0, 0]))
+                root.send_event(msg, event_mask=X.SubstructureRedirectMask | X.SubstructureNotifyMask)
+            d.flush()
+        except error.XError:
+            handled.discard(win.id)
+
+    root.change_attributes(event_mask=X.SubstructureNotifyMask)
+    for child in root.query_tree().children:
+        consider(child)
+    d.flush()
+    while True:
+        try:
+            ev = d.next_event()
+        except error.ConnectionClosedError:
+            return 0
+        if ev.type == X.CreateNotify and not ev.override:
+            try:
+                # select first, then look: no WM_CLASS change can slip between
+                ev.window.change_attributes(event_mask=X.PropertyChangeMask)
+            except error.XError:
+                continue
+            consider(ev.window)
+        elif ev.type == X.PropertyNotify and ev.atom in (Xatom.WM_CLASS, net_wm_pid):
+            consider(ev.window)
+        elif ev.type == X.DestroyNotify:
+            handled.discard(ev.window.id)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

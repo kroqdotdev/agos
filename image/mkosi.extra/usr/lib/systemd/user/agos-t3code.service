@@ -1,0 +1,38 @@
+# agos T3 Code: the T3 Code desktop app (Electron, /opt/t3code) on the agent's
+# display, on the second XFCE workspace (see /usr/lib/agos/agos-t3code). It
+# also hosts T3 Code's local server, so T3 Connect stays online while it runs.
+# Enabled or disabled by agos-firstboot from [agents] t3code.
+[Unit]
+Description=agos T3 Code desktop app (workspace 2 of :1)
+Documentation=https://github.com/pingdotgg/t3code
+ConditionUser=agent
+ConditionPathExists=/opt/t3code/t3code
+Requires=agos-session.service
+After=agos-session.service
+# prevents systemd from giving up after a few quick crashes
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+Environment=DISPLAY=:1
+# prevents update checks and "update available" prompts (the image pins the
+# version; an unpacked AppImage cannot update itself anyway)
+Environment=T3CODE_DISABLE_AUTO_UPDATE=true
+# no product-usage telemetry, like the browsers' policies
+Environment=T3CODE_TELEMETRY_ENABLED=false
+ExecStartPre=/usr/lib/agos/wait-display :1 30
+ExecStart=/usr/lib/agos/agos-t3code
+Restart=always
+# a release that cannot start backs off to one attempt a minute
+RestartSec=3
+RestartSteps=5
+RestartMaxDelaySec=60
+# prevents a 90 s "stop job is running" wait on reboot
+TimeoutStopSec=15
+# T3 Code 0.0.45 (Electron 44) dies with SIGTRAP while quitting on SIGTERM;
+# a stop is not a failure (crashes while running still restart it)
+SuccessExitStatus=TRAP
+
+[Install]
+# started with the session and again after it restarts (it stops with it)
+WantedBy=agos-session.service

@@ -103,8 +103,20 @@ for name in missing:
         xml = re.sub(rf'\s*<property name="{pid}" type="string" value="{re.escape(name)}"\s*/>', "", xml)
         xml = re.sub(rf'\s*<property name="{pid}" type="string" value="{re.escape(name)}">.*?\n\s*</property>', "", xml, flags=re.S)
         xml = re.sub(rf'\s*<value type="int" value="{pid.split("-")[1]}"/>', "", xml)
+# prevents the taskbar on the agent's workspace from showing (blinking) a
+# window on another workspace that asks for attention, e.g. T3 Code on
+# workspace 2 when it starts (xfwm4 activate_action=none marks it urgent)
+blink = '<property name="include-all-blinking" type="bool" value="false"/>'
+def no_blink(m):
+    head, body = m.group(1), m.group(2)
+    if body is None:
+        return f"{head}>\n      {blink}\n    </property>"
+    return m.group(0) if "include-all-blinking" in body else f"{head}>\n      {blink}{body}</property>"
+xml, n = re.subn(r'(<property name="plugin-\d+" type="string" value="tasklist")(?:\s*/>|>(.*?)</property>)',
+                 no_blink, xml, flags=re.S)
 dst.write_text(xml)
-print("agos-postinst: xfce4-panel.xml seeded" + (f", dropped {missing}" if missing else ""))
+print("agos-postinst: xfce4-panel.xml seeded" + (f", dropped {missing}" if missing else "")
+      + f", {n} tasklist(s) without other workspaces' urgent windows")
 PY
 
 # --- vendor apt repositories inside the image ---------------------------------
@@ -169,15 +181,35 @@ install_agentd() {
 }
 install_agentd
 
+# --- T3 Code --------------------------------------------------------------------
+# The desktop app from the pinned AppImage, unpacked by scripts/sync.sh (no
+# FUSE at runtime, no AppImage self-update). Profile "agents" only; at runtime
+# [agents] t3code enables or disables agos-t3code.service (agos-firstboot).
+t3code_version=""
+t3tree="$src/.cache/t3code/root-$arch"
+rm -rf /opt/t3code
+if [[ " ${PROFILES:-} " == *" agents "* && -x "$t3tree/t3code" ]]; then
+  cp -a "$t3tree" /opt/t3code
+  chown -R root:root /opt/t3code
+  chmod -R go-w /opt/t3code
+  # Electron sandboxes its renderers with unprivileged user namespaces (on in
+  # Debian's kernel), so the bundled chrome-sandbox helper stays non-setuid.
+  chmod 0755 /opt/t3code/chrome-sandbox
+  t3code_version="$(sed -n 's/^X-AppImage-Version=//p' /opt/t3code/t3code.desktop)"
+  say "t3code: ${t3code_version:-unknown version} in /opt/t3code"
+else
+  say "t3code: not installed (profile agents: $([[ " ${PROFILES:-} " == *" agents "* ]] && echo on || echo off), tree: $t3tree)"
+fi
+
 # --- build info -----------------------------------------------------------------
 claude_version="$(dpkg-query -W -f='${Version}' claude-code 2>/dev/null || true)"
 kasm_version="$(dpkg-query -W -f='${Version}' kasmvncserver 2>/dev/null || true)"
 kernel="$(find /usr/lib/modules -mindepth 1 -maxdepth 1 -printf '%f\n' | sort -V | tail -n1)"
-python3 - "$version" "$arch" "$agentd_status" "$claude_version" "$kasm_version" "$kernel" <<'PY'
+python3 - "$version" "$arch" "$agentd_status" "$claude_version" "$kasm_version" "$kernel" "$t3code_version" <<'PY'
 import json, sys, datetime
-version, arch, agentd, claude, kasm, kernel = sys.argv[1:]
+version, arch, agentd, claude, kasm, kernel, t3code = sys.argv[1:]
 info = {"version": version, "arch": arch, "agentd": agentd, "claude_code": claude or None,
-        "kasmvnc": kasm, "kernel": kernel,
+        "t3code": t3code or None, "kasmvnc": kasm, "kernel": kernel,
         "built": datetime.datetime.now(datetime.UTC).replace(microsecond=0).isoformat()}
 open("/usr/lib/agos/build-info.json", "w").write(json.dumps(info, indent=2) + "\n")
 print("agos-postinst: build-info", json.dumps(info))

@@ -2,5 +2,8 @@
 enable agos-display.service
 enable agos-session.service
 enable agentd.service
+# T3 Code desktop app (wanted by agos-session); agos-firstboot enforces
+# [agents] t3code on every boot
+enable agos-t3code.service
 # KasmVNC's own vncserver wrapper unit is not used
 disable kasmvncserver@.service

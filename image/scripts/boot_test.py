@@ -9,6 +9,8 @@ without ever sending keyboard input to the VM:
   * the KasmVNC web client answers (with the seeded basic-auth password)
   * the XFCE desktop is up with no dialogs (screenshot via agentd, ffmpeg fallback)
   * agos-browser opens Chromium without first-run/keyring/restore dialogs
+  * T3 Code runs on workspace 2, never shows up on (or switches) the agent's
+    workspace, has no dialogs, and follows [agents] t3code through `agos apply`
   * the viewer permission hook works, the root fs grew, the guest agent answers
   * a reboot comes back to "ready" on its own
 
@@ -312,6 +314,33 @@ def windows(vm: VM) -> list[str]:
     return vm.ssh("DISPLAY=:1 wmctrl -l -x", check=False).stdout.strip().splitlines()
 
 
+def agent_workspace(wins: list[str]) -> list[str]:
+    """wmctrl -l -x lines visible on the agent's workspace (desktop 0 or sticky),
+    minus the panel and the desktop itself."""
+    out = []
+    for w in wins:
+        cols = w.split()
+        if len(cols) >= 3 and cols[1] in ("0", "-1") and "xfce4-panel" not in cols[2] \
+                and "xfdesktop" not in cols[2]:
+            out.append(w)
+    return out
+
+
+def t3_windows(wins: list[str]) -> list[str]:
+    # WM_CLASS com.t3tools.t3code.com.t3tools.T3Code (Electron takes it from the
+    # desktop entry name)
+    return [w for w in wins if len(w.split()) >= 3 and "t3code" in w.split()[2].lower()]
+
+
+def current_desktop(vm: VM) -> str:
+    """wmctrl -d marks the current workspace with '*'."""
+    for line in vm.ssh("DISPLAY=:1 wmctrl -d", check=False).stdout.splitlines():
+        cols = line.split()
+        if len(cols) > 1 and cols[1] == "*":
+            return cols[0]
+    return "?"
+
+
 def wait_windows(vm: VM, match: str, timeout: float) -> list[str]:
     """Poll until a window whose wmctrl line contains `match` appears (browsers
     start in seconds under KVM but can take minutes under TCG emulation)."""
@@ -376,6 +405,10 @@ def main() -> int:
         sysrun = vm.ssh("systemctl is-system-running; systemctl --failed --no-legend --plain", check=False)
         check(results, "system_running", sysrun.stdout.strip().splitlines()[:1] == ["running"],
               sysrun.stdout.strip())
+        # no LLMNR (5355) or mDNS (5353) responder listening on the network
+        llmnr = vm.ssh("ss -Hlnut '( sport = :5355 or sport = :5353 )'", check=False)
+        check(results, "no_llmnr_mdns_listener", llmnr.returncode == 0 and not llmnr.stdout.strip(),
+              llmnr.stdout.strip() or "nothing on 5355/5353")
         cmdline = vm.ssh("cat /proc/cmdline").stdout.strip()
         eff = json.loads(vm.ssh("cat /run/agos/config.json").stdout)
         check(results, "config_layers",
@@ -415,15 +448,109 @@ def main() -> int:
         check(results, "agentd_api", code_h == 200 and code_s == 200 and code_u == 401,
               f"health {code_h} {body_h[:120]!r}, status(token) {code_s}, status(no token) {code_u}")
 
-        # desktop: no dialogs, pinned geometry from the credential
+        # desktop: no dialogs, pinned geometry from the credential. T3 Code
+        # (on by default) starts with the session: wait for its window so the
+        # agent's workspace is checked with it running.
+        t0 = time.monotonic()
+        wait_windows(vm, "t3code", app_timeout * 2)
+        results["t3code_window_s"] = round(time.monotonic() - t0, 1)
         time.sleep(5)
         desk = screenshot(vm, "desktop", out, results)
         geo = vm.ssh("DISPLAY=:1 xdpyinfo | awk '/dimensions/{print $2}'").stdout.strip()
         check(results, "geometry_from_credential", geo == f"{DISPLAY_W}x{DISPLAY_H}", geo)
         wins = windows(vm)
         results["windows_desktop"] = wins
-        check(results, "no_dialog_windows", not any(w for w in wins if "xfce4-panel" not in w
-                                                    and "xfdesktop" not in w), wins)
+        check(results, "no_dialog_windows", not agent_workspace(wins), wins)
+
+        # T3 Code: running, on workspace 2 (index 1), alone there (no dialogs),
+        # the agent's workspace still current and its focus untouched
+        t3 = vm.ssh("systemctl --user is-active agos-t3code; pgrep -u agent -x t3code | head -1; "
+                    "jq -c '{agents, t3code, t3check: .checks.t3code}' /var/lib/agos/state.json; "
+                    "jq -r .t3code /usr/lib/agos/build-info.json; "
+                    "systemctl --user show -p Environment agos-t3code", check=False).stdout.strip().splitlines()
+        results["t3code_status"] = t3
+        check(results, "t3code_running",
+              len(t3) >= 4 and t3[0] == "active" and t3[1].isdigit() and '"t3code":true' in t3[2]
+              and '"t3check":true' in t3[2] and t3[3] not in ("", "null"), t3)
+        st_line = vm.ssh("sudo agos status | grep -E '^  (t3code|check +t3code)'", check=False).stdout.strip()
+        check(results, "agos_status_t3code",
+              "t3code     on, workspace 2" in st_line and "check      t3code: ok" in st_line, st_line)
+        # T3 Connect without the GUI: `agos t3 status` runs T3 Code's own CLI as
+        # the agent user (unpaired here: authorization missing)
+        t3s = vm.ssh("agos t3 status", timeout=90, check=False)
+        check(results, "agos_t3_status_cli",
+              t3s.returncode == 0 and "T3 Connect" in t3s.stdout and "Authorization:" in t3s.stdout,
+              t3s.stdout.strip().splitlines()[:3] or t3s.stderr.strip()[-200:])
+        t3w = t3_windows(wins)
+        active = vm.ssh("DISPLAY=:1 xprop -id \"$(DISPLAY=:1 xdotool getactivewindow)\" WM_CLASS",
+                        check=False).stdout.strip()
+        ws_count = vm.ssh("xfconf-query -c xfwm4 -p /general/workspace_count", check=False).stdout.strip()
+        desk_now = current_desktop(vm)
+        check(results, "t3code_on_workspace_2",
+              len(t3w) == 1 and t3w[0].split()[1] == "1" and desk_now == "0" and ws_count == "2"
+              and "t3code" not in active.lower(),
+              {"t3code_windows": t3w, "current_desktop": desk_now, "workspaces": ws_count, "active_class": active})
+        # pre-seed and zero-touch settings: no welcome wizard, no updates, no telemetry
+        pre = vm.ssh("jq -r .onboardingCompletedAt ~/.t3/userdata/client-settings.json; "
+                     "xfconf-query -c xfwm4 -p /general/activate_action; "
+                     "xfconf-query -c xfwm4 -p /general/scroll_workspaces; "
+                     "jq -r .enableProviderUpdateChecks ~/.t3/userdata/settings.json; "
+                     "grep -rhoE 'Automatic updates[^\"]*' ~/.t3/userdata/logs 2>/dev/null | sort -u | head -3",
+                     check=False).stdout.strip().splitlines()
+        results["t3code_preseed"] = pre
+        env_line = next((x for x in t3 if x.startswith("Environment=")), "")
+        check(results, "t3code_preseed",
+              len(pre) >= 4 and pre[0].startswith("20") and pre[1] == "none" and pre[2] == "false" and pre[3] == "false"
+              and "T3CODE_DISABLE_AUTO_UPDATE=true" in env_line and "T3CODE_TELEMETRY_ENABLED=false" in env_line,
+              {"settings": pre, "environment": env_line})
+        # the agent scrolling on the empty desktop must not switch workspaces
+        http("POST", f"http://127.0.0.1:{AGENTD_PORT}/v1/actions", {"actions": [
+            {"type": "screenshot"}, {"type": "scroll", "x": DISPLAY_W // 2, "y": DISPLAY_H // 2, "dy": 5},
+            {"type": "scroll", "x": DISPLAY_W // 2, "y": DISPLAY_H // 2, "dy": -5}],
+            "screenshot_after": False}, token=AGENTD_TOKEN)
+        time.sleep(1)
+        check(results, "agent_scroll_keeps_workspace", current_desktop(vm) == "0", current_desktop(vm))
+        # a human's view: switch to workspace 2 (test VM only), look, switch back
+        vm.ssh("DISPLAY=:1 wmctrl -s 1", check=False)
+        time.sleep(4)
+        screenshot(vm, "t3code", out, results)
+        seen = current_desktop(vm)
+        # T3 Connect needs a one-time human sign-in: Settings -> Connections ->
+        # "Sign in to T3 Connect" must open T3 Code's own sign-in dialog (no
+        # extra window, nothing on the agent's workspace). Positions are for
+        # the pinned release's layout, relative to its window.
+        geo = dict(kv.split("=", 1) for kv in vm.ssh(
+            "DISPLAY=:1 xdotool search --onlyvisible --classname com.t3tools.t3code getwindowgeometry --shell %@ | tail -6",
+            check=False).stdout.split() if "=" in kv)
+        signin = {}
+        try:
+            gx, gy, gh = int(geo["X"]), int(geo["Y"]), int(geo["HEIGHT"])
+            api_actions = f"http://127.0.0.1:{AGENTD_PORT}/v1/actions"
+            for name, (x, y) in (("settings", (gx + 25, gy + gh - 20)), ("connections", (gx + 84, gy + 391)),
+                                 ("sign-in", (gx + 112, gy + gh - 60))):
+                code, _ = http("POST", api_actions, {"actions": [
+                    {"type": "screenshot"}, {"type": "click", "x": x, "y": y, "coord_space": "screen"},
+                    {"type": "wait", "duration": 3}], "screenshot_after": False}, token=AGENTD_TOKEN)
+                signin[name] = code
+            screenshot(vm, "t3code-signin", out, results)
+            wins_signin = windows(vm)
+            http("POST", api_actions, {"actions": [{"type": "screenshot"}, {"type": "key", "keys": "Escape"},
+                                                   {"type": "wait", "duration": 1},
+                                                   {"type": "click", "x": gx + 60, "y": gy + gh - 20,
+                                                    "coord_space": "screen"}], "screenshot_after": False},
+                 token=AGENTD_TOKEN)
+        except (KeyError, ValueError) as exc:
+            wins_signin = []
+            signin["error"] = repr(exc)
+        check(results, "t3code_signin_in_app",
+              all(v == 200 for k, v in signin.items() if k != "error") and len(signin) == 3
+              and len(t3_windows(wins_signin)) == 1 and not agent_workspace(wins_signin),
+              {"clicks": signin, "windows": wins_signin, "geometry": geo})
+        vm.ssh("DISPLAY=:1 wmctrl -s 0", check=False)
+        time.sleep(1)
+        back = current_desktop(vm)
+        check(results, "t3code_workspace_switch", seen == "1" and back == "0" and not agent_workspace(windows(vm)),
+              {"while_viewing": seen, "after": back})
 
         # agentd end to end: click/type into a terminal, then takeover -> input
         # refused (HUMAN_IN_CONTROL) with the KasmVNC viewer switched to
@@ -502,6 +629,26 @@ def main() -> int:
                     " jq -c . ~/.claude/settings.json", check=False).stdout.strip()
         check(results, "claude_code_preseed", "hasCompletedOnboarding\":true" in cc and "bypassPermissions" in cc, cc)
 
+        # [agents] t3code = false -> `agos apply` stops and disables it and the
+        # second workspace goes away; true again brings both back
+        def t3_state() -> list[str]:
+            return vm.ssh("systemctl --user is-active agos-t3code; systemctl --global is-enabled agos-t3code; "
+                          "xfconf-query -c xfwm4 -p /general/workspace_count", check=False).stdout.split()
+        conf = "/etc/agos/config.toml"
+        vm.ssh(f"sudo cp {conf} {conf}.boot-test && printf '\\n[agents]\\nt3code = false\\n' | sudo tee -a {conf} >/dev/null"
+               " && sudo agos apply >/dev/null 2>&1", check=False, timeout=180)
+        time.sleep(10)
+        off = t3_state() + [str(len(t3_windows(windows(vm))))]
+        vm.ssh(f"sudo mv {conf}.boot-test {conf} && sudo agos apply >/dev/null 2>&1", check=False, timeout=180)
+        wait_windows(vm, "t3code", app_timeout * 2)
+        time.sleep(5)
+        on_wins = t3_windows(windows(vm))
+        on = t3_state() + [on_wins[0].split()[1] if on_wins else "-"]
+        check(results, "t3code_config_toggle",
+              off == ["inactive", "disabled", "1", "0"] and on == ["active", "enabled", "2", "1"]
+              and not agent_workspace(windows(vm)),
+              {"t3code=false": off, "t3code=true": on})
+
         time.sleep(20)
         results["idle_memory"] = vm.ssh("free -m; echo; ps -eo rss,comm --sort=-rss | head -12", check=False).stdout
         mem = vm.ssh("free -m | awk '/^Mem:/{print $3}'", check=False).stdout.strip()
@@ -521,9 +668,14 @@ def main() -> int:
                                 "ready_uptime_s": st2.get("ready_uptime"), "state": st2.get("state")}
             check(results, "reboot_ready", st2.get("state") == "ready" and st2.get("boot_id") != boot_id,
                   {"state": st2.get("state"), "errors": st2.get("errors")})
+            wait_windows(vm, "t3code", app_timeout * 2)
             time.sleep(5)
             screenshot(vm, "desktop-after-reboot", out, results)
-            results["windows_after_reboot"] = windows(vm)
+            results["windows_after_reboot"] = wins = windows(vm)
+            t3w = t3_windows(wins)
+            check(results, "t3code_after_reboot",
+                  len(t3w) == 1 and t3w[0].split()[1] == "1" and current_desktop(vm) == "0"
+                  and not agent_workspace(wins), wins)
 
         failed = [k for k, v in results["checks"].items() if not v["ok"]]
         results["failed"] = failed

@@ -2,6 +2,7 @@
 # Fetch the pinned third-party inputs the mkosi build needs and verify them:
 #   mkosi.packages/kasmvncserver_trixie_<ver>_<arch>.deb   (local apt repo)
 #   mkosi.sandbox/etc/apt/keyrings/{tailscale,claude-code} (build-time apt keys)
+#   .cache/t3code/root-<arch>/                             (T3 Code AppImage, unpacked)
 # Idempotent: files that already match their pinned sha256 are not re-fetched.
 #
 # Usage: scripts/sync.sh <amd64|arm64>
@@ -50,6 +51,45 @@ deb="kasmvncserver_trixie_${KASMVNC_VERSION}_${arch}.deb"
 mkdir -p "$here/mkosi.packages"
 find "$here/mkosi.packages" -maxdepth 1 -name 'kasmvncserver_*.deb' ! -name "$deb" -delete
 fetch "$KASMVNC_URL_BASE/$deb" "$here/mkosi.packages/$deb" "${!sumvar}"
+
+# T3 Code: the AppImage's squashfs payload is unpacked with unsquashfs at the
+# offset where the ELF runtime ends, so the AppImage runtime never runs here
+# and the image needs no FUSE. mkosi.postinst.chroot copies the tree to
+# /opt/t3code (profile "agents").
+case "$arch" in
+  amd64) t3asset="T3-Code-${T3CODE_VERSION}-x86_64.AppImage" ;;
+  arm64) t3asset="T3-Code-${T3CODE_VERSION}-arm64.AppImage" ;;
+esac
+sumvar="T3CODE_SHA256_${arch}"
+t3dir="$here/.cache/t3code"
+mkdir -p "$t3dir"
+find "$t3dir" -maxdepth 1 -name 'T3-Code-*.AppImage' ! -name "$t3asset" -delete
+fetch "$T3CODE_URL_BASE/$t3asset" "$t3dir/$t3asset" "${!sumvar}"
+t3root="$t3dir/root-$arch"
+if [[ "$(cat "$t3root.sha256" 2>/dev/null)" != "${!sumvar}" || ! -x "$t3root/t3code" ]]; then
+  rm -rf "$t3root" "$t3root.sha256"
+  offset="$(python3 - "$t3dir/$t3asset" <<'PY'
+import struct, sys
+with open(sys.argv[1], "rb") as fh:
+    h = fh.read(64)
+    if h[:4] != b"\x7fELF":
+        sys.exit("not an ELF AppImage")
+    if h[4] == 2:   # ELFCLASS64
+        shoff, = struct.unpack_from("<Q", h, 0x28); shentsize, shnum = struct.unpack_from("<HH", h, 0x3A)
+    else:
+        shoff, = struct.unpack_from("<I", h, 0x20); shentsize, shnum = struct.unpack_from("<HH", h, 0x2E)
+    end = shoff + shentsize * shnum   # the squashfs image follows the section headers
+    fh.seek(end)
+    if fh.read(4) != b"hsqs":
+        sys.exit("no squashfs after the AppImage runtime")
+    print(end)
+PY
+)"
+  unsquashfs -q -n -no-xattrs -o "$offset" -d "$t3root" "$t3dir/$t3asset" >/dev/null
+  [[ -x "$t3root/t3code" ]] || { echo "sync: $t3asset has no t3code executable" >&2; exit 3; }
+  echo "${!sumvar}" > "$t3root.sha256"
+  echo "sync: unpacked $t3asset ($(du -sh "$t3root" | cut -f1))" >&2
+fi
 
 keydir="$here/mkosi.sandbox/etc/apt/keyrings"
 fetch "$TAILSCALE_KEYRING_URL" "$keydir/tailscale-archive-keyring.gpg" "$TAILSCALE_KEYRING_SHA256"

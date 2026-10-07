@@ -8,7 +8,8 @@ user manager (user@1000.service) starts. Implements docs/spec.md "First boot":
      systemd credentials), validate, write /run/agos/config.json
   2. generate missing secrets (AGENTD_TOKEN, VIEWER_PASSWORD when needed)
   3. render the KasmVNC display/users, agentd config + tokens, the agent's
-     environment, the console banner and the Claude Code pre-seed
+     environment, the console banner and the Claude Code / T3 Code pre-seeds;
+     enable or disable the T3 Code user unit
   4. join Tailscale and publish the viewer/agentd with `tailscale serve`
   5. write /var/lib/agos/state.json
 
@@ -62,6 +63,11 @@ AGOS_LABEL_DEV = Path("/dev/disk/by-label/AGOS")
 ISSUE = Path("/etc/issue.d/agos.issue")
 AGENTD_BIN = Path("/opt/agentd/bin/agentd")
 AGENTD_PY = Path("/opt/agentd/bin/python")
+T3CODE_BIN = Path("/opt/t3code/t3code")
+T3CODE_UNIT = "agos-t3code.service"
+T3CODE_WORKSPACE = 2              # XFCE numbering (1-based); see /usr/lib/agos/agos-t3code
+# reported by `agos status` and state.json, but never hold back or fail "ready"
+OPTIONAL_CHECKS = ("t3code",)
 IMAGE_HOSTNAMES = ("agos", "localhost", "")
 KASM_OWNER = "agos-admin"
 AGENTD_TOKEN_NAME = "agos-admin"
@@ -309,6 +315,7 @@ SCHEMA = {
     "tailscale.serve": ("bool", None),
     "tailscale.ssh": ("bool", None),
     "agents.claude_code": ("bool", None),
+    "agents.t3code": ("bool", None),
 }
 PASSTHROUGH_TABLES = ("agentd",)
 
@@ -629,6 +636,10 @@ def render_agent(cfg: dict, sec: dict, eff: dict, run: Run) -> None:
     if cfg["agents"]["claude_code"]:
         preseed_claude(home, uid, gid, sec, eff, run)
 
+    # --- T3 Code ------------------------------------------------------------
+    if cfg["agents"]["t3code"] and T3CODE_BIN.exists():
+        preseed_t3code(home, uid, gid, run)
+
 
 def render_agentd_config(cfg: dict, eff: dict, run: Run) -> None:
     """~agent/.config/agentd/config.toml; only keys the installed agentd accepts."""
@@ -712,6 +723,56 @@ def preseed_claude(home: Path, uid: int, gid: int, sec: dict, eff: dict, run: Ru
         resp["rejected"] = [r for r in resp.get("rejected", []) if r != key[-20:]]
         state["customApiKeyResponses"] = resp
     write_file(state_path, json.dumps(state, indent=2) + "\n", 0o600, uid, gid)
+
+
+def preseed_t3code(home: Path, uid: int, gid: int, run: Run) -> None:
+    """Merge (never replace) the T3 Code settings that keep it from prompting."""
+    data = home / ".t3/userdata"
+    ensure_dir(home / ".t3", 0o700, uid, gid)
+    ensure_dir(data, 0o700, uid, gid)
+    path = data / "client-settings.json"
+    settings = read_json(path)
+    if path.exists() and not settings:
+        run.warn(f"T3 Code: {path} is not a JSON object; left alone")
+        return
+    if not settings.get("onboardingCompletedAt"):
+        # prevents the first-run welcome wizard (connect computers, check
+        # agents, import projects); T3 Connect sign-in stays in Settings
+        settings["onboardingCompletedAt"] = now_iso()
+        write_file(path, json.dumps(settings, indent=2) + "\n", 0o644, uid, gid)
+    path = data / "settings.json"
+    settings = read_json(path)
+    if path.exists() and not settings:
+        run.warn(f"T3 Code: {path} is not a JSON object; left alone")
+        return
+    if "enableProviderUpdateChecks" not in settings:
+        # prevents "Update Available: Claude" notices: Claude Code comes from
+        # apt (unattended-upgrades), which T3 Code's "Update now" cannot drive
+        settings["enableProviderUpdateChecks"] = False
+        write_file(path, json.dumps(settings, indent=2) + "\n", 0o644, uid, gid)
+
+
+def apply_t3code(cfg: dict, run: Run) -> dict:
+    """Enable or disable the T3 Code user unit from [agents] t3code."""
+    installed = T3CODE_BIN.exists()
+    enabled = bool(cfg["agents"]["t3code"]) and installed
+    info = {"enabled": enabled, "installed": installed, "version": build_info().get("t3code"),
+            "workspace": T3CODE_WORKSPACE if enabled else None}
+    if not installed and cfg["agents"]["t3code"]:
+        run.log("T3 Code: enabled in the config but not installed in this image")
+    # --global edits /etc/systemd/user, which the agent's user manager reads
+    # when it starts (this unit runs before user@1000.service; `agos apply`
+    # reloads it). The unit has ConditionPathExists, so disabling a missing
+    # app is cosmetic.
+    is_on = sh(["systemctl", "--global", "is-enabled", "--quiet", T3CODE_UNIT], timeout=30).returncode == 0
+    if enabled != is_on:
+        res = sh(["systemctl", "--global", "enable" if enabled else "disable", T3CODE_UNIT], timeout=30)
+        if res.returncode != 0:
+            run.error(f"T3 Code: systemctl --global {'enable' if enabled else 'disable'} failed: "
+                      f"{res.stderr.strip()[-200:]}")
+        else:
+            run.log(f"T3 Code: {'enabled' if enabled else 'disabled'}")
+    return info
 
 
 # --------------------------------------------------------------------------
@@ -943,6 +1004,12 @@ def apply(run: Run) -> int:
     except (KeyError, OSError, subprocess.SubprocessError) as exc:
         run.error(f"render: {exc!r}")
 
+    t3_info: dict = {"enabled": False}
+    try:
+        t3_info = apply_t3code(cfg, run)
+    except (OSError, subprocess.SubprocessError) as exc:
+        run.error(f"T3 Code: {exc!r}")
+
     ts_info: dict = {"enabled": False}
     try:
         ts_info = setup_tailscale(cfg, sec, eff, run)
@@ -973,7 +1040,9 @@ def apply(run: Run) -> int:
                    "loopback": loop},
         "agentd": {"listen": cfg["agentd"]["listen"], "installed": eff["agentd_installed"]},
         "tailscale": ts_info,
-        "agents": {"claude_code": cfg["agents"]["claude_code"] and bool(shutil.which("claude"))},
+        "agents": {"claude_code": cfg["agents"]["claude_code"] and bool(shutil.which("claude")),
+                   "t3code": bool(t3_info.get("enabled"))},
+        "t3code": t3_info,
         "errors": run.errors,
         "warnings": run.warnings,
         "firstboot_seconds": round(time.monotonic() - started, 2),
@@ -1014,6 +1083,14 @@ def checks(state: dict) -> dict:
         out["xfce4-panel"] = sh(["pgrep", "-u", AGENT, "-x", "xfce4-panel"], timeout=5).returncode == 0
     except (OSError, subprocess.SubprocessError):
         out["x11"] = out["xfce4-panel"] = False
+    if state.get("agents", {}).get("t3code"):
+        try:
+            out["t3code"] = (
+                sh(prefix + ["systemctl", "--user", "is-active", "--quiet", T3CODE_UNIT], timeout=10,
+                   env=env).returncode == 0
+                and sh(["pgrep", "-u", AGENT, "-x", "t3code"], timeout=5).returncode == 0)
+        except (OSError, subprocess.SubprocessError):
+            out["t3code"] = False
     port = int(state.get("viewer", {}).get("port", 8444))
     host = "127.0.0.1" if state.get("viewer", {}).get("listen") in ("0.0.0.0", "::", "127.0.0.1", None) \
         else state["viewer"]["listen"]
@@ -1037,6 +1114,7 @@ def checks(state: dict) -> dict:
 
 def wait_ready(run: Run, timeout: float) -> int:
     deadline = time.monotonic() + timeout
+    optional_deadline = None
     state = read_json(STATE)
     result: dict = {}
     while True:
@@ -1045,17 +1123,26 @@ def wait_ready(run: Run, timeout: float) -> int:
         except Exception as exc:  # keep polling; report at the deadline
             result = {"checks": False}
             run.warn(f"readiness check failed: {exc!r}")
-        if all(result.values()):
+        ok = all(v for k, v in result.items() if k not in OPTIONAL_CHECKS)
+        if ok and all(result.values()):
             break
+        if ok:
+            # optional apps (T3 Code) get a short grace period once the desktop is up
+            optional_deadline = optional_deadline or time.monotonic() + 30
+            if time.monotonic() > optional_deadline:
+                break
         if time.monotonic() > deadline:
             break
         time.sleep(2)
     state = read_json(STATE) or state
-    ok = all(result.values())
     state["checks"] = result
     state["ready_uptime"] = round(uptime_s(), 2)
+    for name in OPTIONAL_CHECKS:
+        if result.get(name) is False:
+            state.setdefault("warnings", []).append(
+                f"{name}: not running (journalctl --user -u agos-{name} as agent)")
     if not ok:
-        failed = [k for k, v in result.items() if not v]
+        failed = [k for k, v in result.items() if not v and k not in OPTIONAL_CHECKS]
         state.setdefault("errors", []).append(f"desktop not ready after {int(timeout)}s: {', '.join(failed)}")
     # Spec: "ready" or "error" (+ "message"); "starting" only while waiting.
     if ok and not state.get("errors"):

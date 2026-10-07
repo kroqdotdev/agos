@@ -1,9 +1,19 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!-- agos: compositing off (less CPU under Xvnc, no GL needed) and a single
-     workspace so windows cannot "disappear" onto another one. -->
+     workspace so windows cannot "disappear" onto another one. With T3 Code
+     enabled agos-session raises workspace_count to 2 (T3 Code lives on the
+     second one); the rest keeps the agent's workspace to itself. -->
 <channel name="xfwm4" version="1.0">
   <property name="general" type="empty">
     <property name="use_compositing" type="bool" value="false"/>
     <property name="workspace_count" type="int" value="1"/>
+    <!-- prevents a window on another workspace that asks to be activated
+         (T3 Code calls focus() when it starts) from being pulled onto the
+         agent's workspace or switching to its own; it is only marked urgent -->
+    <property name="activate_action" type="string" value="none"/>
+    <!-- prevents the mouse wheel on the desktop from switching workspaces -->
+    <property name="scroll_workspaces" type="bool" value="false"/>
+    <!-- prevents a window dragged past the screen edge from switching workspaces -->
+    <property name="wrap_windows" type="bool" value="false"/>
   </property>
 </channel>

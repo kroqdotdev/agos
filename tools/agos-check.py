@@ -208,7 +208,12 @@ class Check:
         self.check("unattended_upgrades", uu.split() == ["enabled", "active"], uu.split())
         wd = self.sh("systemctl show -p RuntimeWatchdogUSec --value")
         self.check("hardware_watchdog", wd not in ("", "0", "infinity"), wd)
-        ntp = self.sh("timedatectl show -p NTPSynchronized --value")
+        # a VM checked right after first boot may not have reached an NTP server yet
+        ntp = self.sh(
+            "for i in $(seq 30); do s=$(timedatectl show -p NTPSynchronized --value); "
+            '[ "$s" = yes ] && break; sleep 3; done; echo "$s"',
+            timeout=120,
+        )
         self.check("clock_synchronized", ntp == "yes", ntp)
         sshd = dict(
             line.split(" ", 1)
@@ -239,12 +244,31 @@ class Check:
         self.record("journal_errors", "INFO", errs.replace("\n", " | ") or "none")
         return cfg
 
-    def desktop(self) -> None:
+    def desktop(self, cfg: dict) -> None:
         dims = self.x("xdpyinfo | awk '/dimensions:/{print $2}'")
         self.check("display_1280x800", dims == "1280x800", dims)
         wins = self.x("wmctrl -l -x").splitlines()
-        stray = [w for w in wins if not any(k in w for k in ("xfce4-panel", "xfdesktop", "t3code", "T3"))]
-        self.check("no_dialog_windows", not stray, stray or [w.split(None, 3)[-1] for w in wins])
+        # wmctrl -l -x: id, workspace (-1 = all), WM_CLASS, host, title. Only the
+        # agent's workspace (0) must hold nothing but the panel and the desktop.
+        agent_ws = [w for w in wins if len(w.split()) > 2 and w.split()[1] in ("0", "-1")]
+        stray = [w for w in agent_ws if not any(k in w for k in ("xfce4-panel", "xfdesktop"))]
+        self.check("no_dialog_windows", not stray, stray or [w.split(None, 4)[-1] for w in agent_ws])
+        found = [
+            ln.split()[3]
+            for ln in self.sh("ss -Hlnu; ss -Hlnt").splitlines()
+            if len(ln.split()) > 3 and ln.split()[3].rsplit(":", 1)[-1] in ("5355", "5353")
+        ]
+        self.check("no_llmnr_mdns", not found, found or "nothing on 5355/5353")
+        if cfg.get("agents", {}).get("t3code"):
+            unit = self.sh("systemctl --user is-active agos-t3code")
+            t3 = [w for w in wins if "t3code" in w.lower()]
+            on_ws2 = bool(t3) and all(w.split()[1] == "1" for w in t3)
+            self.check("t3code_on_workspace_2", unit == "active" and on_ws2, {"unit": unit, "windows": t3})
+            st = self.ssh("agos t3 status", timeout=120)
+            auth = next((ln.strip() for ln in st.stdout.splitlines() if "Authorization:" in ln), "")
+            self.check("t3_connect_cli", st.returncode == 0 and "T3 Connect" in st.stdout, auth or st.stderr[-200:])
+        else:
+            self.record("t3code_on_workspace_2", "SKIP", "[agents] t3code is off")
         xset = self.x("xset q")
         saver_off = re.search(r"timeout:\s+0\b", xset) is not None
         # KasmVNC's Xvnc has no DPMS extension at all, which is stricter than "disabled".
@@ -668,7 +692,7 @@ def main() -> int:
     sec = c.read_secrets()
     try:
         cfg = c.system()
-        c.desktop()
+        c.desktop(cfg)
         c.viewer(cfg, sec, args.viewer)
         c.open_tunnel()
         c.agentd_basics()

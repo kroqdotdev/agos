@@ -604,13 +604,18 @@ t_reset() {
 	expect_rc 0
 	expect_json commands '["qm stop 100","qm rollback 100 golden","qm start 100"]'
 	expect_not_called '^qm (rollback|stop|start)'
-	agos reset --yes --json
+	# the rolled-back state.json says "ready" from the previous boot: reset
+	# must wait for one written during the new boot
+	: >"$FAKE_LOG"
+	FAKE_STALE_READS=3 agos reset --yes --json
 	expect_rc 0
 	expect_json action reset
 	expect_json state ready
 	expect_called '^qm stop 100$'
 	expect_called '^qm rollback 100 golden$'
 	expect_called '^qm start 100$'
+	[[ $(grep -c 'guest exec 100 .*cat /var/lib/agos/state.json' "$FAKE_LOG") -ge 4 ]] ||
+		fail "reset returned on the stale pre-rollback state"
 	# no golden snapshot -> refuse
 	qm create 200 --name nosnap --tags agos >/dev/null
 	agos reset --vmid 200 --yes

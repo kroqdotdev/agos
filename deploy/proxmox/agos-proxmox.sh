@@ -197,7 +197,13 @@ run() {
 	log "  + $(quote_cmd "$@")"
 	# 9>&-: never hand the create lock to children. `qm start` daemonizes the
 	# VM's kvm process, which would otherwise hold the lock for its lifetime.
-	"$@" 9>&-
+	# Their output goes to stderr: stdout is reserved for --json's one object.
+	if ((JSON)); then
+		# drop qm's per-percent disk import progress from machine-read logs
+		"$@" 9>&- | sed -u '/^transferred /d' >&2
+	else
+		"$@" 9>&- >&2
+	fi
 }
 
 # ------------------------------------------------------------------ JSON (perl ships with every PVE host)
@@ -1219,9 +1225,10 @@ guest_exec_out() {
 
 read_guest_state() {
 	local js
-	GUEST_STATE="" GUEST_MSG=""
+	GUEST_STATE="" GUEST_MSG="" GUEST_BOOT=""
 	js=$(guest_exec_out "$1" cat /var/lib/agos/state.json) || return 0
 	GUEST_STATE=$(json_get state <<<"$js" 2>/dev/null) || GUEST_STATE="unknown"
+	GUEST_BOOT=$(json_get boot_id <<<"$js" 2>/dev/null) || GUEST_BOOT=""
 	GUEST_MSG=$(json_get message <<<"$js" 2>/dev/null) || GUEST_MSG=$(json_get error <<<"$js" 2>/dev/null) || GUEST_MSG=""
 }
 
@@ -1795,6 +1802,25 @@ cmd_reset() {
 	deadline=$((SECONDS + TIMEOUT))
 	until timeout 20 qm agent "$T_VMID" ping >/dev/null 2>&1; do
 		((SECONDS < deadline)) || die "$EX_TIMEOUT" "VM $T_VMID did not answer on the guest agent within ${TIMEOUT}s after the reset"
+		sleep "$POLL_INTERVAL"
+	done
+	# The snapshot's state.json already says "ready" (from before the rollback),
+	# so only a state written during this boot counts.
+	info "waiting for agos to report ready"
+	local boot=""
+	while :; do
+		if [[ -z $boot ]]; then
+			boot=$(guest_exec_out "$T_VMID" cat /proc/sys/kernel/random/boot_id) || boot=""
+			boot=${boot//[[:space:]]/}
+		fi
+		read_guest_state "$T_VMID"
+		if [[ -n $boot && $GUEST_BOOT == "$boot" ]]; then
+			case $GUEST_STATE in
+			ready) break ;;
+			failed | error) die "$EX_VMOP" "VM $T_VMID reported '$GUEST_STATE' after the reset${GUEST_MSG:+: $GUEST_MSG}" ;;
+			esac
+		fi
+		((SECONDS < deadline)) || die "$EX_TIMEOUT" "VM $T_VMID did not report ready within ${TIMEOUT}s after the reset (state: ${GUEST_STATE:-none})"
 		sleep "$POLL_INTERVAL"
 	done
 	gather_info "$T_VMID"

@@ -89,6 +89,11 @@ set)
 	shift
 	need_local_vm "$vmid"
 	apply_opts "$vmid" "$@"
+	# The real qm prints import progress on stdout.
+	if [[ "$*" == *import-from=* ]]; then
+		printf 'update VM %s: %s\n' "$vmid" "$*"
+		for p in 0.00 50.00 100.00; do printf 'transferred 0.0 B of 4.6 GiB (%s%%)\n' "$p"; done
+	fi
 	;;
 config)
 	need_local_vm "$1"
@@ -106,6 +111,7 @@ start)
 		echo running >"$QDIR/$1.status"
 	fi
 	rm -f "$QDIR/$1.pings" "$QDIR/$1.reads"
+	echo "boot-$1-$(date +%s%N)" >"$QDIR/$1.boot"
 	# Like the real kvm process, linger with every inherited file descriptor
 	# (a leaked lock would block the next create).
 	sleep 30 >/dev/null 2>&1 &
@@ -214,8 +220,16 @@ agent | guest)
 		if [[ ${FAKE_NEVER_READY:-0} == 1 ]] || ((n < ${FAKE_READY_AFTER:-1})); then
 			perl -MJSON::PP -e 'print encode_json({exitcode => 1, exited => 1, "err-data" => "cat: /var/lib/agos/state.json: No such file or directory\n"})'
 		else
-			json_out 0 "{\"state\": \"${FAKE_GUEST_STATE:-ready}\", \"version\": \"0.1.0\", \"message\": \"fake guest\"}"
+			boot=$(cat "$QDIR/$vmid.boot" 2>/dev/null || echo none)
+			# FAKE_STALE_READS: the first N reads after a start still show the
+			# state.json from the previous boot (what a rolled-back snapshot holds).
+			if ((n < ${FAKE_STALE_READS:-0})); then boot=previous-boot; fi
+			json_out 0 "{\"state\": \"${FAKE_GUEST_STATE:-ready}\", \"version\": \"0.1.0\", \"message\": \"fake guest\", \"boot_id\": \"$boot\"}"
 		fi
+		;;
+	"cat /proc/sys/kernel/random/boot_id")
+		json_out 0 "$(cat "$QDIR/$vmid.boot" 2>/dev/null || echo none)
+"
 		;;
 	"cat /run/agos/config.json")
 		listen=127.0.0.1
